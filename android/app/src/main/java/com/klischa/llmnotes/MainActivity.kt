@@ -1,0 +1,183 @@
+package com.klischa.llmnotes
+
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
+import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.ViewModelProvider
+import com.klischa.llmnotes.ui.ChatScreen
+import com.klischa.llmnotes.ui.LLMNotesTheme
+import java.io.File
+
+class MainActivity : ComponentActivity() {
+
+    private lateinit var viewModel: LLMViewModel
+
+    // Лаунчер выбора файла .gguf из проводника Android
+    private val openDocumentLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    it,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+
+            val directPath = getRealPathFromUri(it)
+            if (directPath != null && File(directPath).canRead() && File(directPath).length() > 0) {
+                viewModel.saveLastModelInfo(directPath, it.toString(), File(directPath).name)
+                viewModel.loadModel(directPath)
+            } else {
+                viewModel.saveLastModelInfo(null, it.toString(), "GGUF Модель")
+                viewModel.loadModelUri(it)
+            }
+        }
+    }
+
+    // Лаунчер выбора текстового файла (скрепка в чате)
+    private val openAttachmentLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let {
+            try {
+                var displayName = "file.txt"
+                var size = 0L
+                contentResolver.query(it, null, null, null, null)?.use { cursor ->
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (cursor.moveToFirst()) {
+                        if (nameIdx != -1) displayName = cursor.getString(nameIdx) ?: displayName
+                        if (sizeIdx != -1) size = cursor.getLong(sizeIdx)
+                    }
+                }
+
+                val directPath = getRealPathFromUri(it)
+                val bytes = contentResolver.openInputStream(it)?.use { input -> input.readBytes() } ?: ByteArray(0)
+                val isBinary = bytes.take(1024).any { b -> b == 0.toByte() }
+                if (isBinary) {
+                    Toast.makeText(this, "⚠️ Бинарный файл не поддерживается для анализа", Toast.LENGTH_LONG).show()
+                } else {
+                    val text = String(bytes, Charsets.UTF_8).take(25000)
+                    viewModel.attachFile(displayName, size, text, directPath)
+                    Toast.makeText(this, "📎 Файл '$displayName' прикреплен к запросу", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, "Ошибка чтения файла: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    // Запрос разрешений на чтение медиа (фото/видео) для Device Tools
+    private val requestMediaPermissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        // Телеметрия обновится автоматически при первом обращении
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        try {
+            System.setProperty("http.agent", com.klischa.llmnotes.api.OpenCodeClient.OPENCODE_USER_AGENT)
+        } catch (_: Exception) {}
+
+        viewModel = ViewModelProvider(this)[LLMViewModel::class.java]
+
+        // 1. Запрос доступа к медиафайлам (для работы с фото/видео)
+        requestMediaPermissions()
+
+        // 2. Запрос разрешения доступа ко всем файлам для прямого zero-copy чтения моделей
+        checkAndRequestAllFilesAccess()
+
+        // 3. Автоматическая загрузка последней выбранной модели
+        viewModel.tryAutoLoadLastModel()
+
+        setContent {
+            LLMNotesTheme {
+                ChatScreen(
+                    viewModel = viewModel,
+                    onSelectModelClick = {
+                        openDocumentLauncher.launch(arrayOf("*/*"))
+                    },
+                    onAttachFileClick = {
+                        openAttachmentLauncher.launch(arrayOf("*/*"))
+                    }
+                )
+            }
+        }
+    }
+
+    private fun requestMediaPermissions() {
+        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            arrayOf(
+                android.Manifest.permission.READ_MEDIA_IMAGES,
+                android.Manifest.permission.READ_MEDIA_VIDEO,
+                android.Manifest.permission.READ_MEDIA_AUDIO
+            )
+        } else {
+            arrayOf(
+                android.Manifest.permission.READ_EXTERNAL_STORAGE
+            )
+        }
+        try {
+            requestMediaPermissionsLauncher.launch(permissions)
+        } catch (_: Exception) {}
+    }
+
+    private fun checkAndRequestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) {
+                    try {
+                        val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                        startActivity(intent)
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    /**
+     * Попытка извлечь реальный путь к файлу из URI провайдера Android,
+     * если приложению предоставлен доступ к файловой системе (All Files Access).
+     */
+    private fun getRealPathFromUri(uri: Uri): String? {
+        if (uri.scheme == "file") return uri.path
+        if (uri.scheme == "content") {
+            try {
+                if (DocumentsContract.isDocumentUri(this, uri)) {
+                    val docId = DocumentsContract.getDocumentId(uri)
+                    if (docId.startsWith("primary:")) {
+                        val relPath = docId.substring("primary:".length)
+                        val extDir = Environment.getExternalStorageDirectory().absolutePath
+                        val directFile = File(extDir, relPath)
+                        if (directFile.exists() && directFile.canRead()) {
+                            return directFile.absolutePath
+                        }
+                    } else if (docId.startsWith("raw:")) {
+                        val rawPath = docId.substring("raw:".length)
+                        val rawFile = File(rawPath)
+                        if (rawFile.exists() && rawFile.canRead()) {
+                            return rawFile.absolutePath
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        return null
+    }
+}
