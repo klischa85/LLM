@@ -3,10 +3,20 @@ package com.klischa.llmnotes
 data class ParsedMessage(
     val thinkingText: String? = null,
     val answerText: String = "",
-    val isStillThinking: Boolean = false
+    val isStillThinking: Boolean = false,
+    val agentStepsText: String? = null,
+    val isPreparingToolCall: Boolean = false
 )
 
 object ThoughtParser {
+    private val AGENT_STEPS_REGEX = Regex(
+        """<agent_steps>\s*(.*?)\s*</agent_steps>""",
+        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+    )
+    private val COMPLETE_TOOL_CALL_REGEX = Regex(
+        """<tool_call>\s*.*?\s*</tool_call>""",
+        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+    )
     val STOP_MARKERS = listOf(
         "<|",
         "<｜",
@@ -49,38 +59,61 @@ object ThoughtParser {
     }
 
     /**
-     * Разделяет рассуждения модели (<think>...</think>) и окончательный ответ пользователю
+     * Разделяет шаги агента (<agent_steps>), рассуждения модели (<think>...</think>),
+     * скрывает сырые блоки <tool_call> во время стриминга и возвращает чистый ответ.
      */
     fun parse(rawText: String, isStreaming: Boolean = false): ParsedMessage {
-        val cleaned = cleanStopTokens(rawText).trimStart()
+        var working = cleanStopTokens(rawText).trimStart()
+
+        // 0. Извлекаем блок выполненных шагов агента (<agent_steps>...</agent_steps>)
+        val stepsMatches = AGENT_STEPS_REGEX.findAll(working).map { it.groupValues[1].trim() }.filter { it.isNotBlank() }.toList()
+        val agentSteps = if (stepsMatches.isNotEmpty()) stepsMatches.joinToString("\n") else null
+        if (agentSteps != null) {
+            working = AGENT_STEPS_REGEX.replace(working, "").trimStart()
+        }
+
+        // Проверяем, не формирует ли модель прямо сейчас блок <tool_call>
+        var isPreparingTool = false
+        working = COMPLETE_TOOL_CALL_REGEX.replace(working, "").trim()
+        val openToolIdx = working.indexOf("<tool_call>", ignoreCase = true)
+        if (openToolIdx != -1) {
+            isPreparingTool = isStreaming
+            working = working.substring(0, openToolIdx).trimEnd()
+        }
 
         // Случай 1: Присутствует закрывающий тег </think> (модель завершила рассуждения и выдала ответ)
-        if (cleaned.contains("</think>")) {
-            val parts = cleaned.split("</think>", limit = 2)
+        if (working.contains("</think>")) {
+            val parts = working.split("</think>", limit = 2)
             val thought = cleanStopTokens(parts[0].replace("<think>", "").trim())
             val answer = cleanStopTokens(parts[1].trim())
             return ParsedMessage(
                 thinkingText = thought.ifBlank { null },
                 answerText = answer,
-                isStillThinking = false
+                isStillThinking = false,
+                agentStepsText = agentSteps,
+                isPreparingToolCall = isPreparingTool
             )
         }
 
         // Случай 2: Текст начинается с <think>, но закрывающего тега еще нет (идет процесс размышления)
-        if (cleaned.startsWith("<think>")) {
-            val thought = cleanStopTokens(cleaned.removePrefix("<think>").trim())
+        if (working.startsWith("<think>")) {
+            val thought = cleanStopTokens(working.removePrefix("<think>").trim())
             return ParsedMessage(
                 thinkingText = thought.ifBlank { null },
                 answerText = "",
-                isStillThinking = isStreaming
+                isStillThinking = isStreaming,
+                agentStepsText = agentSteps,
+                isPreparingToolCall = isPreparingTool
             )
         }
 
         // Случай 3: Обычный ответ без рассуждений
         return ParsedMessage(
             thinkingText = null,
-            answerText = cleaned,
-            isStillThinking = false
+            answerText = working,
+            isStillThinking = false,
+            agentStepsText = agentSteps,
+            isPreparingToolCall = isPreparingTool
         )
     }
 }

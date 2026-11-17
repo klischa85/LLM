@@ -7,7 +7,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.DocumentsContract
-import android.provider.OpenableColumns
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -16,7 +15,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.ViewModelProvider
 import com.klischa.llmnotes.ui.ChatScreen
 import com.klischa.llmnotes.ui.LLMNotesTheme
-import java.io.ByteArrayOutputStream
 import java.io.File
 
 class MainActivity : ComponentActivity() {
@@ -25,7 +23,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_PREFILL_PROMPT = "extra_prefill_prompt"
-        private const val MAX_ATTACHMENT_READ_BYTES = 256 * 1024 // 256 КБ — защита от OOM
     }
 
     // Лаунчер выбора файла .gguf из проводника Android
@@ -51,42 +48,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Лаунчер выбора текстового файла (скрепка в чате) с защитой от OOM
+    // Универсальный лаунчер выбора файла ЛЮБОГО формата (скриншоты, фото, PDF, Office, архивы, аудио/видео, текст, бинарники)
     private val openAttachmentLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
-            try {
-                var displayName = "file.txt"
-                var size = 0L
-                contentResolver.query(it, null, null, null, null)?.use { cursor ->
-                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
-                    if (cursor.moveToFirst()) {
-                        if (nameIdx != -1) displayName = cursor.getString(nameIdx) ?: displayName
-                        if (sizeIdx != -1) size = cursor.getLong(sizeIdx)
-                    }
+            val directPath = getRealPathFromUri(it)
+            viewModel.attachUri(it, directPath) { errMsg ->
+                runOnUiThread {
+                    Toast.makeText(this, errMsg, Toast.LENGTH_LONG).show()
                 }
-
-                val directPath = getRealPathFromUri(it)
-                val bytes = readBoundedBytes(it, MAX_ATTACHMENT_READ_BYTES)
-                val checkLen = bytes.size.coerceAtMost(1024)
-                var isBinary = false
-                for (i in 0 until checkLen) {
-                    if (bytes[i] == 0.toByte()) {
-                        isBinary = true
-                        break
-                    }
-                }
-                if (isBinary) {
-                    Toast.makeText(this, "⚠️ Бинарный файл не поддерживается для анализа", Toast.LENGTH_LONG).show()
-                } else {
-                    val text = String(bytes, Charsets.UTF_8).take(25000)
-                    viewModel.attachFile(displayName, if (size > 0) size else bytes.size.toLong(), text, directPath)
-                    Toast.makeText(this, "📎 Файл '$displayName' прикреплен к запросу", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                Toast.makeText(this, "Ошибка чтения файла: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -96,6 +67,23 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
         // Телеметрия обновится автоматически при первом обращении
+    }
+
+    // Запрос разрешения com.termux.permission.RUN_COMMAND (при отказе открывает настройки приложения)
+    private val requestTermuxPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        viewModel.refreshTermuxStatus()
+        if (granted) {
+            Toast.makeText(this, "✅ Разрешение Termux RUN_COMMAND выдано!", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(
+                this,
+                "Откройте «Разрешения → Доп. разрешения → Run commands in Termux»",
+                Toast.LENGTH_LONG
+            ).show()
+            openAppSettings()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -115,7 +103,7 @@ class MainActivity : ComponentActivity() {
         // 3. Автоматическая загрузка локальной GGUF модели только в локальном режиме
         viewModel.tryAutoLoadLastModel()
 
-        // 4. Поддержка передачи текста из виджета быстрого запроса
+        // 4. Поддержка передачи текста и файлов из виджета / системного «Поделиться»
         handleIncomingIntent(intent)
 
         setContent {
@@ -127,9 +115,22 @@ class MainActivity : ComponentActivity() {
                     },
                     onAttachFileClick = {
                         openAttachmentLauncher.launch(arrayOf("*/*"))
+                    },
+                    onRequestTermuxPermissionClick = {
+                        requestTermuxPermission()
+                    },
+                    onOpenStoragePermissionClick = {
+                        openAllFilesAccessSettings()
                     }
                 )
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::viewModel.isInitialized) {
+            viewModel.refreshTermuxStatus()
         }
     }
 
@@ -140,26 +141,36 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIncomingIntent(intent: Intent?) {
-        val prefill = intent?.getStringExtra(EXTRA_PREFILL_PROMPT)?.trim()
+        if (intent == null) return
+
+        val prefill = intent.getStringExtra(EXTRA_PREFILL_PROMPT)?.trim()
         if (!prefill.isNullOrEmpty()) {
             viewModel.updateInputText(prefill)
             intent.removeExtra(EXTRA_PREFILL_PROMPT)
         }
-    }
 
-    private fun readBoundedBytes(uri: Uri, maxBytes: Int): ByteArray {
-        val out = ByteArrayOutputStream()
-        contentResolver.openInputStream(uri)?.use { input ->
-            val buf = ByteArray(8192)
-            var total = 0
-            while (total < maxBytes) {
-                val read = input.read(buf, 0, minOf(buf.size, maxBytes - total))
-                if (read <= 0) break
-                out.write(buf, 0, read)
-                total += read
+        // Поддержка системного «Поделиться» (скриншоты, фото, PDF, документы, текст и любые файлы)
+        if (intent.action == Intent.ACTION_SEND) {
+            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()
+            if (!sharedText.isNullOrEmpty()) {
+                viewModel.updateInputText(sharedText)
+                intent.removeExtra(Intent.EXTRA_TEXT)
+            }
+            @Suppress("DEPRECATION")
+            val sharedUri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
+            if (sharedUri != null) {
+                viewModel.attachUri(sharedUri) { errMsg ->
+                    runOnUiThread {
+                        Toast.makeText(this, errMsg, Toast.LENGTH_LONG).show()
+                    }
+                }
+                intent.removeExtra(Intent.EXTRA_STREAM)
             }
         }
-        return out.toByteArray()
     }
 
     private fun requestMediaPermissions() {
@@ -177,6 +188,41 @@ class MainActivity : ComponentActivity() {
         try {
             requestMediaPermissionsLauncher.launch(permissions)
         } catch (_: Exception) {}
+    }
+
+    private fun requestTermuxPermission() {
+        val status = TermuxBridge.checkStatus(this)
+        if (!status.isInstalled) {
+            Toast.makeText(this, "Termux не найден. Установите Termux с F-Droid или GitHub.", Toast.LENGTH_LONG).show()
+            return
+        }
+        try {
+            requestTermuxPermissionLauncher.launch(TermuxBridge.PERMISSION_RUN_COMMAND)
+        } catch (_: Exception) {
+            openAppSettings()
+        }
+    }
+
+    private fun openAppSettings() {
+        try {
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            startActivity(intent)
+        } catch (_: Exception) {}
+    }
+
+    private fun openAllFilesAccessSettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+                return
+            } catch (_: Exception) {}
+        }
+        openAppSettings()
     }
 
     private fun checkAndRequestAllFilesAccessOnce() {

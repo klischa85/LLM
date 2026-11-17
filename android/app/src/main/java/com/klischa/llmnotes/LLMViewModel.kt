@@ -12,6 +12,7 @@ import androidx.lifecycle.viewModelScope
 import com.klischa.llmnotes.api.ApiChatMessage
 import com.klischa.llmnotes.api.LLMProviderType
 import com.klischa.llmnotes.api.OpenCodeClient
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -61,7 +62,13 @@ data class AttachedDoc(
     val name: String,
     val sizeBytes: Long,
     val content: String,
-    val path: String? = null
+    val path: String? = null,
+    val mimeType: String = "application/octet-stream",
+    val category: AttachmentCategory = AttachmentCategory.TEXT,
+    val imageBase64: String? = null,
+    val imageWidth: Int = 0,
+    val imageHeight: Int = 0,
+    val summaryBadge: String = ""
 )
 
 data class UiState(
@@ -93,7 +100,16 @@ data class UiState(
     val allocatedRamMb: Long = 0,
     val threadCount: Int = 2, // Оптимум 2 ядра Cortex-A76 для Helio G99
     val temperature: Float = 0.6f,
-    val topP: Float = 0.9f
+    val topP: Float = 0.9f,
+    // Режим агента (работа с файлами устройства и Termux RUN_COMMAND)
+    val agentModeEnabled: Boolean = true,
+    val agentConfirmationMode: AgentConfirmationMode = AgentConfirmationMode.CONFIRM_DESTRUCTIVE,
+    val isAgentDialogVisible: Boolean = false,
+    val termuxStatus: TermuxStatus = TermuxStatus(isInstalled = false, hasRunPermission = false),
+    val termuxTestOutput: String = "",
+    val isTestingTermux: Boolean = false,
+    val pendingToolApproval: PendingToolApproval? = null,
+    val activeToolStatus: String? = null
 ) {
     val currentApiKey: String
         get() = when (providerType) {
@@ -123,8 +139,12 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile
     private var isLocalCancelled: Boolean = false
 
+    @Volatile
+    private var pendingApprovalDeferred: CompletableDeferred<Boolean>? = null
+
     companion object {
         private const val TAG = "LLMViewModel"
+        private const val MAX_AGENT_STEPS = 8
         private const val PREFS_NAME = "llm_app_prefs"
         private const val PREF_LAST_MODEL_PATH = "last_model_path"
         private const val PREF_LAST_MODEL_URI = "last_model_uri"
@@ -142,6 +162,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREF_OPENCODE_MODEL_ZEN = "opencode_model_zen"
         private const val PREF_OPENROUTER_MODEL = "openrouter_model"
         private const val PREF_GROQ_MODEL = "groq_model"
+        private const val PREF_AGENT_MODE_ENABLED = "agent_mode_enabled"
+        private const val PREF_AGENT_CONFIRM_MODE = "agent_confirm_mode"
     }
 
     fun saveLastModelInfo(directPath: String?, uriStr: String?, displayName: String) {
@@ -274,6 +296,15 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         }
         val models = OpenCodeClient.getDefaultModels(provider)
 
+        val agentEnabled = prefs.getBoolean(PREF_AGENT_MODE_ENABLED, true)
+        val confirmStr = prefs.getString(PREF_AGENT_CONFIRM_MODE, AgentConfirmationMode.CONFIRM_DESTRUCTIVE.name)
+        val confirmMode = try {
+            AgentConfirmationMode.valueOf(confirmStr ?: "")
+        } catch (_: Exception) {
+            AgentConfirmationMode.CONFIRM_DESTRUCTIVE
+        }
+        val termuxStatus = TermuxBridge.checkStatus(getApplication())
+
         _uiState.update { current ->
             val updated = current.copy(
                 providerType = provider,
@@ -283,9 +314,86 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 openRouterApiKey = keyOpenRouter,
                 groqApiKey = keyGroq,
                 openCodeSelectedModel = selectedModel,
-                openCodeAvailableModels = models
+                openCodeAvailableModels = models,
+                agentModeEnabled = agentEnabled,
+                agentConfirmationMode = confirmMode,
+                termuxStatus = termuxStatus
             )
             updated.copy(statusMessage = buildIdleStatus(updated))
+        }
+    }
+
+    fun setAgentModeEnabled(enabled: Boolean) {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(PREF_AGENT_MODE_ENABLED, enabled).apply()
+        _uiState.update {
+            it.copy(
+                agentModeEnabled = enabled,
+                statusMessage = if (enabled) "🤖 Режим агента включён (файлы и Termux)" else "Режим агента выключен (обычный чат)"
+            )
+        }
+    }
+
+    fun setAgentConfirmationMode(mode: AgentConfirmationMode) {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(PREF_AGENT_CONFIRM_MODE, mode.name).apply()
+        _uiState.update {
+            it.copy(
+                agentConfirmationMode = mode,
+                statusMessage = "Подтверждение агента: ${mode.title}"
+            )
+        }
+    }
+
+    fun setAgentDialogVisible(visible: Boolean) {
+        if (visible) {
+            refreshTermuxStatus()
+        }
+        _uiState.update { it.copy(isAgentDialogVisible = visible) }
+    }
+
+    fun refreshTermuxStatus() {
+        val status = TermuxBridge.checkStatus(getApplication())
+        _uiState.update { it.copy(termuxStatus = status) }
+    }
+
+    fun approveToolCall() {
+        val d = pendingApprovalDeferred
+        pendingApprovalDeferred = null
+        _uiState.update { it.copy(pendingToolApproval = null) }
+        d?.complete(true)
+    }
+
+    fun denyToolCall() {
+        val d = pendingApprovalDeferred
+        pendingApprovalDeferred = null
+        _uiState.update { it.copy(pendingToolApproval = null) }
+        d?.complete(false)
+    }
+
+    fun testTermuxConnection() {
+        if (_uiState.value.isTestingTermux) return
+        refreshTermuxStatus()
+        _uiState.update { it.copy(isTestingTermux = true, termuxTestOutput = "Выполняю тестовую команду в Termux...") }
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = TermuxBridge.runCommand(
+                context = getApplication(),
+                command = "echo \"Termux OK | $(uname -m) | bash $(bash --version | head -n1 | cut -d' ' -f4)\"",
+                workdir = AgentTools.storageRootCanonical(),
+                timeoutSeconds = 15
+            )
+            val msg = if (res.success) {
+                "✅ ${res.stdout.trim()}"
+            } else {
+                "⚠️ ${res.errorMessage ?: res.stderr.ifBlank { "Код выхода: ${res.exitCode}" }}"
+            }
+            _uiState.update {
+                it.copy(
+                    isTestingTermux = false,
+                    termuxTestOutput = msg,
+                    termuxStatus = TermuxBridge.checkStatus(getApplication())
+                )
+            }
         }
     }
 
@@ -473,6 +581,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
         isRemoteCancelled = true
         isLocalCancelled = true
+        pendingApprovalDeferred?.complete(false)
+        pendingApprovalDeferred = null
+        TermuxBridge.cancelAllPending()
         LlamaBridge.nativeStop()
         openPfd?.close()
         openPfd = null
@@ -481,11 +592,43 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun attachFile(name: String, sizeBytes: Long, content: String, path: String? = null) {
+        attachParsedDoc(
+            AttachedDoc(
+                name = name,
+                sizeBytes = sizeBytes,
+                content = content,
+                path = path,
+                summaryBadge = UniversalFileParser.formatSize(sizeBytes)
+            )
+        )
+    }
+
+    fun attachParsedDoc(doc: AttachedDoc) {
         _uiState.update {
             it.copy(
-                attachedDoc = AttachedDoc(name, sizeBytes, content, path),
-                statusMessage = "Файл '$name' прикреплен к запросу"
+                attachedDoc = doc,
+                statusMessage = "${doc.category.emoji} Прикреплён файл: ${doc.name}" +
+                    if (doc.summaryBadge.isNotBlank()) " (${doc.summaryBadge})" else ""
             )
+        }
+    }
+
+    /**
+     * Универсальное асинхронное прикрепление файла ЛЮБОГО формата по content:// URI
+     * (скриншоты, фото, PDF, DOCX/XLSX/PPTX, EPUB/FB2/RTF, ZIP/APK, аудио, видео, текст, бинарники).
+     */
+    fun attachUri(uri: Uri, directPath: String? = null, onError: ((String) -> Unit)? = null) {
+        _uiState.update { it.copy(statusMessage = "Чтение и обработка файла...") }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val parsed = UniversalFileParser.parseUri(getApplication(), uri, directPath)
+                attachParsedDoc(parsed)
+            } catch (e: Exception) {
+                Log.e(TAG, "Ошибка прикрепления файла: ${e.message}", e)
+                val msg = "Ошибка чтения файла: ${e.message ?: "неизвестная ошибка"}"
+                _uiState.update { it.copy(statusMessage = msg) }
+                onError?.invoke(msg)
+            }
         }
     }
 
@@ -781,7 +924,11 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         if ((rawPrompt.isEmpty() && attached == null) || stateSnapshot.isGenerating) return
 
         val prompt = rawPrompt.ifEmpty {
-            "Проанализируй прикреплённый файл (${attached?.name ?: "документ"})"
+            when (attached?.category) {
+                AttachmentCategory.IMAGE -> "Опиши и проанализируй это изображение (${attached.name})"
+                AttachmentCategory.PDF -> "Проанализируй прикреплённый PDF-документ (${attached.name})"
+                else -> "Проанализируй прикреплённый файл (${attached?.name ?: "документ"})"
+            }
         }
 
         val isLocal = stateSnapshot.providerType == LLMProviderType.LOCAL_GGUF
@@ -796,10 +943,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val displayUserText = if (attached != null && rawPrompt.isNotEmpty()) {
-            "📎 ${attached.name}\n$prompt"
-        } else if (attached != null) {
-            "📎 ${attached.name}\n$prompt"
+        val displayUserText = if (attached != null) {
+            val badge = attached.summaryBadge.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
+            "${attached.category.emoji} ${attached.name}$badge\n$prompt"
         } else {
             prompt
         }
@@ -824,6 +970,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         val activeTemperature = stateSnapshot.temperature
         val activeTopP = stateSnapshot.topP
         val baseSysPrompt = stateSnapshot.systemPrompt.trim()
+        val agentEnabled = stateSnapshot.agentModeEnabled
+        val activeConfirmMode = stateSnapshot.agentConfirmationMode
 
         _uiState.update {
             it.copy(
@@ -831,6 +979,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 attachedDoc = null,
                 messages = updatedMessages,
                 isGenerating = true,
+                pendingToolApproval = null,
+                activeToolStatus = null,
                 statusMessage = "Генерация ответа...",
                 tokensPerSecond = 0.0f,
                 totalTokensGenerated = 0
@@ -840,7 +990,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         isRemoteCancelled = false
         isLocalCancelled = false
 
-        // Вся работа с БД, файлами, телеметрией и сетью/инференсом — в фоновом потоке (без блокировки UI)
+        // Вся работа с БД, файлами, телеметрией, Termux и сетью/инференсом — в фоновом потоке
         viewModelScope.launch(Dispatchers.IO) {
             val currentChatId = existingChatId.ifBlank {
                 val newId = UUID.randomUUID().toString()
@@ -867,7 +1017,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             val rolesList = mutableListOf<String>()
             val contentsList = mutableListOf<String>()
 
-            // 1. Системный промпт + телеметрия устройства (Device Tools)
+            // 1. Системный промпт + телеметрия устройства + инструкции режима агента (файлы и Termux)
             val telemetryContext = if (DeviceTools.isDeviceQuery(prompt)) {
                 try {
                     DeviceTools.buildTelemetryContext(getApplication())
@@ -879,18 +1029,24 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 ""
             }
 
-            val effectiveSysPrompt = when {
-                baseSysPrompt.isNotEmpty() && telemetryContext.isNotEmpty() -> "$baseSysPrompt\n\n$telemetryContext"
-                telemetryContext.isNotEmpty() -> telemetryContext
-                else -> baseSysPrompt
+            val agentPrompt = if (agentEnabled) {
+                val tStatus = TermuxBridge.checkStatus(getApplication())
+                _uiState.update { it.copy(termuxStatus = tStatus) }
+                AgentTools.buildAgentSystemPrompt(tStatus)
+            } else {
+                ""
             }
+
+            val effectiveSysPrompt = listOf(baseSysPrompt, telemetryContext, agentPrompt)
+                .filter { it.isNotBlank() }
+                .joinToString("\n\n")
 
             if (effectiveSysPrompt.isNotBlank()) {
                 rolesList.add("system")
                 contentsList.add(effectiveSysPrompt)
             }
 
-            // 2. История предыдущих реплик (очищаем служебные токены и <think>-блоки для экономии контекста и совместимости с DeepSeek R1)
+            // 2. История предыдущих реплик (очищаем <think> и <agent_steps> для экономии контекста и совместимости с DeepSeek R1)
             for (msg in historyForPrompt) {
                 if (msg.role == MessageRole.USER) {
                     rolesList.add("user")
@@ -905,65 +1061,126 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            // 3. Текущее сообщение пользователя с проверкой вложений и локальных файлов
+            // 3. Текущее сообщение пользователя с проверкой вложений и локальных файлов (любых форматов)
+            val currentImageDataUrls = mutableListOf<String>()
             val filePrefix = if (attached != null) {
-                "[Прикрепленный файл: ${attached.name} (${attached.sizeBytes / 1024} КБ)]:\n```\n${attached.content}\n```\n\n"
+                if (attached.imageBase64 != null) {
+                    currentImageDataUrls.add("data:image/jpeg;base64,${attached.imageBase64}")
+                }
+                val sizeLabel = UniversalFileParser.formatSize(attached.sizeBytes)
+                if (attached.category == AttachmentCategory.TEXT) {
+                    val ext = attached.name.substringAfterLast('.', "").lowercase()
+                    "[Прикреплённый файл: ${attached.name} ($sizeLabel)]:\n```$ext\n${attached.content}\n```\n\n"
+                } else {
+                    "[Прикреплённый файл: ${attached.name} ($sizeLabel, ${attached.mimeType})]:\n${attached.content}\n\n"
+                }
             } else ""
 
-            val (enrichedPrompt, loadedLocalFiles) = FileStorageManager.enrichPromptWithLocalFiles(prompt)
+            val (enrichedPrompt, loadedLocalFiles, localImages) =
+                FileStorageManager.enrichPromptWithLocalFilesAndImages(getApplication(), prompt)
+            currentImageDataUrls.addAll(localImages)
             val finalUserPromptForModel = filePrefix + enrichedPrompt
 
             rolesList.add("user")
             contentsList.add(finalUserPromptForModel)
 
-            // Ветка 1: Внешний облачный API (DeepSeek / OpenRouter / Groq / OpenCode ZEN / GO)
-            if (!isLocal) {
-                val startTime = System.currentTimeMillis()
-                var tokenCount = 0
-                val responseBuilder = StringBuilder()
+            val maxSteps = if (agentEnabled) MAX_AGENT_STEPS else 1
+            val agentLogLines = mutableListOf<String>()
+            val startTime = System.currentTimeMillis()
+            var totalTokens = 0
+            var finalStepText = ""
 
+            // Ветка 1: Внешний облачный API (DeepSeek / OpenRouter / Groq / OpenCode ZEN / GO) с многошаговым агентным циклом
+            if (!isLocal) {
                 val apiMessages = ArrayList<ApiChatMessage>(rolesList.size)
                 for (i in 0 until rolesList.size) {
-                    apiMessages.add(ApiChatMessage(rolesList[i], contentsList[i]))
+                    val isCurrentUserMsg = (i == rolesList.lastIndex && rolesList[i] == "user")
+                    apiMessages.add(
+                        ApiChatMessage(
+                            role = rolesList[i],
+                            content = contentsList[i],
+                            imageDataUrls = if (isCurrentUserMsg) currentImageDataUrls else emptyList()
+                        )
+                    )
                 }
 
                 try {
-                    OpenCodeClient.streamChatCompletions(
-                        provider = activeProvider,
-                        apiKey = activeApiKey,
-                        model = activeRemoteModel,
-                        messages = apiMessages,
-                        conversationId = currentChatId,
-                        temperature = activeTemperature,
-                        onToken = { tokenPiece ->
-                            tokenCount++
-                            responseBuilder.append(tokenPiece)
-                            val currentText = ThoughtParser.cleanStopTokens(responseBuilder.toString())
-                            val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
-                            val speed = if (elapsedSec > 0.05f) tokenCount / elapsedSec else 0.0f
+                    for (step in 1..maxSteps) {
+                        if (isRemoteCancelled) break
+                        val stepBuilder = StringBuilder()
+                        val stepsPrefix = buildStepsPrefix(agentLogLines)
 
-                            _uiState.update { current ->
-                                val msgs = current.messages.map { m ->
-                                    if (m.id == assistantMsgId) {
-                                        m.copy(text = currentText, tokensPerSec = speed, isStreaming = true)
-                                    } else {
-                                        m
+                        OpenCodeClient.streamChatCompletions(
+                            provider = activeProvider,
+                            apiKey = activeApiKey,
+                            model = activeRemoteModel,
+                            messages = apiMessages,
+                            conversationId = currentChatId,
+                            temperature = activeTemperature,
+                            onToken = { tokenPiece ->
+                                totalTokens++
+                                stepBuilder.append(tokenPiece)
+                                val currentStepClean = ThoughtParser.cleanStopTokens(stepBuilder.toString())
+                                val liveDisplay = stepsPrefix + currentStepClean
+                                val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
+                                val speed = if (elapsedSec > 0.05f) totalTokens / elapsedSec else 0.0f
+
+                                _uiState.update { current ->
+                                    val msgs = current.messages.map { m ->
+                                        if (m.id == assistantMsgId) {
+                                            m.copy(text = liveDisplay, tokensPerSec = speed, isStreaming = true)
+                                        } else {
+                                            m
+                                        }
                                     }
+                                    current.copy(
+                                        messages = msgs,
+                                        totalTokensGenerated = totalTokens,
+                                        tokensPerSecond = speed,
+                                        generationTimeSeconds = elapsedSec
+                                    )
                                 }
-                                current.copy(
-                                    messages = msgs,
-                                    totalTokensGenerated = tokenCount,
-                                    tokensPerSecond = speed,
-                                    generationTimeSeconds = elapsedSec
-                                )
-                            }
-                        },
-                        isCancelled = { isRemoteCancelled }
-                    )
+                            },
+                            isCancelled = { isRemoteCancelled }
+                        )
+
+                        val stepRaw = ThoughtParser.cleanStopTokens(stepBuilder.toString())
+                        finalStepText = stepRaw
+
+                        val toolCalls = if (agentEnabled && !isRemoteCancelled) {
+                            AgentTools.extractToolCalls(stepRaw)
+                        } else {
+                            emptyList()
+                        }
+
+                        if (toolCalls.isEmpty() || step == maxSteps) {
+                            break
+                        }
+
+                        // Выполняем запрошенные агентом инструменты (с подтверждением опасных действий!)
+                        val observation = executeAgentToolCalls(
+                            calls = toolCalls,
+                            confirmMode = activeConfirmMode,
+                            agentLogLines = agentLogLines,
+                            assistantMsgId = assistantMsgId,
+                            isCancelled = { isRemoteCancelled }
+                        )
+                        if (isRemoteCancelled) break
+
+                        apiMessages.add(ApiChatMessage("assistant", stepRaw))
+                        apiMessages.add(
+                            ApiChatMessage(
+                                "user",
+                                "$observation\n\nПродолжи выполнение задачи или дай итоговый ответ пользователю на русском языке."
+                            )
+                        )
+                        _uiState.update { it.copy(statusMessage = "Агент анализирует результат (шаг ${step + 1})...") }
+                    }
 
                     val totalElapsed = (System.currentTimeMillis() - startTime) / 1000f
-                    val finalSpeed = if (totalElapsed > 0.05f) tokenCount / totalElapsed else 0.0f
-                    val finalText = ThoughtParser.cleanStopTokens(responseBuilder.toString())
+                    val finalSpeed = if (totalElapsed > 0.05f) totalTokens / totalElapsed else 0.0f
+                    val cleanFinalBody = AgentTools.stripToolCallBlocks(finalStepText)
+                    val finalText = buildStepsPrefix(agentLogLines) + cleanFinalBody
                     val wasCancelled = isRemoteCancelled
 
                     val completedMsg = ChatMessage(
@@ -977,10 +1194,11 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     val refreshedSessions = dbHelper.getAllSessions()
 
                     val fileNote = if (loadedLocalFiles.isNotEmpty()) " (файлы: ${loadedLocalFiles.joinToString()})" else ""
+                    val stepsNote = if (agentLogLines.isNotEmpty()) " • действий: ${agentLogLines.size}" else ""
                     val doneStatus = if (wasCancelled) {
                         "Генерация остановлена пользователем"
                     } else {
-                        "Готово. Токенов: $tokenCount (~${String.format(Locale.US, "%.1f", finalSpeed)} tok/s)$fileNote"
+                        "Готово. Токенов: $totalTokens (~${String.format(Locale.US, "%.1f", finalSpeed)} tok/s)$stepsNote$fileNote"
                     }
 
                     _uiState.update { current ->
@@ -991,13 +1209,15 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                             messages = msgs,
                             chatSessions = refreshedSessions,
                             isGenerating = false,
+                            pendingToolApproval = null,
+                            activeToolStatus = null,
                             statusMessage = doneStatus,
                             tokensPerSecond = finalSpeed,
                             generationTimeSeconds = totalElapsed
                         )
                     }
 
-                    // Обновляем виджет на рабочем столе (передаем чистый ответ без <think>)
+                    // Обновляем виджет на рабочем столе (передаем чистый ответ без <think> и <agent_steps>)
                     val widgetAnswer = ThoughtParser.parse(finalText, isStreaming = false).answerText.ifBlank { finalText }
                     if (widgetAnswer.isNotBlank()) {
                         LLMWidgetProvider.updateAllWidgets(
@@ -1009,7 +1229,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Ошибка генерации через ${activeProvider.displayName}: ${e.message}")
-                    val errText = "⚠️ Ошибка API (${activeProvider.displayName}): ${e.message ?: "Сбой соединения"}"
+                    val errText = buildStepsPrefix(agentLogLines) +
+                        "⚠️ Ошибка API (${activeProvider.displayName}): ${e.message ?: "Сбой соединения"}"
                     val errorMsg = ChatMessage(
                         id = assistantMsgId,
                         role = MessageRole.ASSISTANT,
@@ -1024,6 +1245,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                         current.copy(
                             messages = msgs,
                             isGenerating = false,
+                            pendingToolApproval = null,
+                            activeToolStatus = null,
                             statusMessage = "Ошибка ${activeProvider.displayName}: ${e.message}"
                         )
                     }
@@ -1031,61 +1254,90 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            // Ветка 2: Локальная модель GGUF
-            val formattedPrompt = LlamaBridge.nativeFormatChat(
-                rolesList.toTypedArray(),
-                contentsList.toTypedArray()
-            )
+            // Ветка 2: Локальная модель GGUF (также поддерживает агентные инструменты!)
+            for (step in 1..maxSteps) {
+                if (isLocalCancelled) break
+                val formattedPrompt = LlamaBridge.nativeFormatChat(
+                    rolesList.toTypedArray(),
+                    contentsList.toTypedArray()
+                )
+                val stepBuilder = StringBuilder()
+                val stepsPrefix = buildStepsPrefix(agentLogLines)
 
-            val startTime = System.currentTimeMillis()
-            var tokenCount = 0
-            val responseBuilder = StringBuilder()
+                val callback = LlamaBridge.TokenCallback { tokenPiece ->
+                    totalTokens++
+                    stepBuilder.append(tokenPiece)
 
-            val callback = LlamaBridge.TokenCallback { tokenPiece ->
-                tokenCount++
-                responseBuilder.append(tokenPiece)
-
-                for (marker in ThoughtParser.STOP_MARKERS) {
-                    val idx = responseBuilder.indexOf(marker)
-                    if (idx != -1) {
-                        LlamaBridge.stopGeneration()
-                        responseBuilder.setLength(idx)
-                        break
-                    }
-                }
-
-                val currentText = ThoughtParser.cleanStopTokens(responseBuilder.toString())
-                val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
-                val speed = if (elapsedSec > 0.05f) tokenCount / elapsedSec else 0.0f
-
-                _uiState.update { current ->
-                    val msgs = current.messages.map { m ->
-                        if (m.id == assistantMsgId) {
-                            m.copy(text = currentText, tokensPerSec = speed, isStreaming = true)
-                        } else {
-                            m
+                    for (marker in ThoughtParser.STOP_MARKERS) {
+                        val idx = stepBuilder.indexOf(marker)
+                        if (idx != -1) {
+                            LlamaBridge.stopGeneration()
+                            stepBuilder.setLength(idx)
+                            break
                         }
                     }
-                    current.copy(
-                        messages = msgs,
-                        totalTokensGenerated = tokenCount,
-                        tokensPerSecond = speed,
-                        generationTimeSeconds = elapsedSec
-                    )
+
+                    val currentStepClean = ThoughtParser.cleanStopTokens(stepBuilder.toString())
+                    val liveDisplay = stepsPrefix + currentStepClean
+                    val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
+                    val speed = if (elapsedSec > 0.05f) totalTokens / elapsedSec else 0.0f
+
+                    _uiState.update { current ->
+                        val msgs = current.messages.map { m ->
+                            if (m.id == assistantMsgId) {
+                                m.copy(text = liveDisplay, tokensPerSec = speed, isStreaming = true)
+                            } else {
+                                m
+                            }
+                        }
+                        current.copy(
+                            messages = msgs,
+                            totalTokensGenerated = totalTokens,
+                            tokensPerSecond = speed,
+                            generationTimeSeconds = elapsedSec
+                        )
+                    }
                 }
+
+                LlamaBridge.nativeGenerate(
+                    formattedPrompt,
+                    1024,
+                    activeTemperature,
+                    activeTopP,
+                    callback
+                )
+
+                val stepRaw = ThoughtParser.cleanStopTokens(stepBuilder.toString())
+                finalStepText = stepRaw
+
+                val toolCalls = if (agentEnabled && !isLocalCancelled) {
+                    AgentTools.extractToolCalls(stepRaw)
+                } else {
+                    emptyList()
+                }
+                if (toolCalls.isEmpty() || step == maxSteps) {
+                    break
+                }
+
+                val observation = executeAgentToolCalls(
+                    calls = toolCalls,
+                    confirmMode = activeConfirmMode,
+                    agentLogLines = agentLogLines,
+                    assistantMsgId = assistantMsgId,
+                    isCancelled = { isLocalCancelled }
+                )
+                if (isLocalCancelled) break
+
+                rolesList.add("assistant")
+                contentsList.add(stepRaw)
+                rolesList.add("user")
+                contentsList.add("$observation\n\nПродолжи задачу или ответь пользователю на русском языке.")
             }
 
-            LlamaBridge.nativeGenerate(
-                formattedPrompt,
-                1024,
-                activeTemperature,
-                activeTopP,
-                callback
-            )
-
             val totalElapsed = (System.currentTimeMillis() - startTime) / 1000f
-            val finalSpeed = if (totalElapsed > 0.05f) tokenCount / totalElapsed else 0.0f
-            val finalText = ThoughtParser.cleanStopTokens(responseBuilder.toString())
+            val finalSpeed = if (totalElapsed > 0.05f) totalTokens / totalElapsed else 0.0f
+            val cleanFinalBody = AgentTools.stripToolCallBlocks(finalStepText)
+            val finalText = buildStepsPrefix(agentLogLines) + cleanFinalBody
             val wasCancelled = isLocalCancelled
 
             val completedMsg = ChatMessage(
@@ -1099,10 +1351,11 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             val refreshedSessions = dbHelper.getAllSessions()
 
             val fileNote = if (loadedLocalFiles.isNotEmpty()) " (файлы: ${loadedLocalFiles.joinToString()})" else ""
+            val stepsNote = if (agentLogLines.isNotEmpty()) " • действий: ${agentLogLines.size}" else ""
             val doneStatus = if (wasCancelled) {
                 "Генерация остановлена пользователем"
             } else {
-                "Готово. Токенов: $tokenCount (~${String.format(Locale.US, "%.1f", finalSpeed)} tok/s)$fileNote"
+                "Готово. Токенов: $totalTokens (~${String.format(Locale.US, "%.1f", finalSpeed)} tok/s)$stepsNote$fileNote"
             }
 
             _uiState.update { current ->
@@ -1113,6 +1366,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     messages = msgs,
                     chatSessions = refreshedSessions,
                     isGenerating = false,
+                    pendingToolApproval = null,
+                    activeToolStatus = null,
                     statusMessage = doneStatus,
                     tokensPerSecond = finalSpeed,
                     generationTimeSeconds = totalElapsed
@@ -1129,6 +1384,81 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     "Офлайн GGUF • ${_uiState.value.modelPath}"
                 )
             }
+        }
+    }
+
+    private fun buildStepsPrefix(agentLogLines: List<String>): String {
+        if (agentLogLines.isEmpty()) return ""
+        return "<agent_steps>\n${agentLogLines.joinToString("\n")}\n</agent_steps>\n\n"
+    }
+
+    private suspend fun executeAgentToolCalls(
+        calls: List<AgentToolCall>,
+        confirmMode: AgentConfirmationMode,
+        agentLogLines: MutableList<String>,
+        assistantMsgId: String,
+        isCancelled: () -> Boolean
+    ): String {
+        val observations = StringBuilder()
+
+        for (call in calls) {
+            if (isCancelled()) break
+
+            if (AgentTools.needsConfirmation(call, confirmMode)) {
+                val approval = AgentTools.buildApprovalPrompt(call)
+                val deferred = CompletableDeferred<Boolean>()
+                pendingApprovalDeferred = deferred
+                _uiState.update {
+                    it.copy(
+                        pendingToolApproval = approval,
+                        activeToolStatus = "⏳ Ожидание подтверждения: ${approval.title}",
+                        statusMessage = "Подтвердите действие агента в чате"
+                    )
+                }
+
+                val approved = deferred.await()
+                pendingApprovalDeferred = null
+                _uiState.update { it.copy(pendingToolApproval = null) }
+
+                if (!approved || isCancelled()) {
+                    val shortTarget = approval.targetDisplay.lineSequence().firstOrNull()?.take(56) ?: ""
+                    agentLogLines.add("⛔ Отклонено: ${approval.title} ($shortTarget)")
+                    updateAssistantStepsPreview(assistantMsgId, agentLogLines)
+                    observations.append("<tool_result tool=\"${call.tool}\" status=\"denied\">\n")
+                    observations.append("[Отклонено пользователем] Пользователь запретил выполнять операцию '${approval.title}' для '$shortTarget'.")
+                    observations.append("\n</tool_result>\n")
+                    continue
+                }
+            }
+
+            _uiState.update {
+                it.copy(
+                    activeToolStatus = "⚙️ Выполняется: ${call.tool}...",
+                    statusMessage = "Агент выполняет ${call.tool}..."
+                )
+            }
+
+            val res = AgentTools.execute(getApplication(), call)
+            val icon = if (res.ok) "✅" else "❌"
+            agentLogLines.add("$icon ${res.summary}")
+            updateAssistantStepsPreview(assistantMsgId, agentLogLines)
+
+            observations.append("<tool_result tool=\"${call.tool}\" status=\"${if (res.ok) "ok" else "error"}\">\n")
+            observations.append(res.output)
+            observations.append("\n</tool_result>\n")
+        }
+
+        _uiState.update { it.copy(activeToolStatus = null) }
+        return observations.toString().trim()
+    }
+
+    private fun updateAssistantStepsPreview(assistantMsgId: String, agentLogLines: List<String>) {
+        val prefix = buildStepsPrefix(agentLogLines)
+        _uiState.update { current ->
+            val msgs = current.messages.map { m ->
+                if (m.id == assistantMsgId) m.copy(text = prefix, isStreaming = true) else m
+            }
+            current.copy(messages = msgs)
         }
     }
 
@@ -1191,6 +1521,10 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             isRemoteCancelled = true
         }
+        pendingApprovalDeferred?.complete(false)
+        pendingApprovalDeferred = null
+        TermuxBridge.cancelAllPending()
+
         val currentId = _uiState.value.currentChatId
         _uiState.update { current ->
             val msgs = current.messages.map { m ->
@@ -1207,6 +1541,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             current.copy(
                 messages = msgs,
                 isGenerating = false,
+                pendingToolApproval = null,
+                activeToolStatus = null,
                 statusMessage = "Генерация остановлена пользователем"
             )
         }

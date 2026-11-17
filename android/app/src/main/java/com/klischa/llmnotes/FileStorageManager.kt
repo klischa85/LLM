@@ -30,7 +30,7 @@ object FileStorageManager {
     private const val MAX_READ_CHARS = 25000
 
     private val PATH_PATTERN = Pattern.compile(
-        """(?:/sdcard/|/storage/emulated/0/|/storage/[^\s"':;,]+|Download/[^\s"':;,]+|Documents/[^\s"':;,]+|[a-zA-Z0-9_\-./]+\.(?:py|txt|json|csv|md|log|kt|java|c|cpp|h|sh|html|xml|yaml|yml|sql|js|ts|conf|ini|env))""",
+        """(?:/sdcard/|/storage/emulated/0/|/storage/[^\s"':;,]+|Download/[^\s"':;,]+|Documents/[^\s"':;,]+|Pictures/[^\s"':;,]+|DCIM/[^\s"':;,]+|[a-zA-Z0-9_\-./]+\.(?:py|txt|json|csv|md|log|kt|java|c|cpp|h|sh|html|xml|yaml|yml|sql|js|ts|conf|ini|env|png|jpg|jpeg|webp|gif|bmp|pdf|docx|xlsx|pptx|odt|epub|fb2|rtf|zip|apk|gz|mp3|wav|mp4|db|sqlite))""",
         Pattern.CASE_INSENSITIVE
     )
 
@@ -95,25 +95,17 @@ object FileStorageManager {
     }
 
     /**
-     * Безопасное чтение текстового файла (с защитой от бинарных данных и переполнения контекста).
+     * Универсальное чтение файла любого формата (текст, PDF, Office, изображения, архивы, бинарники).
      */
     fun readTextFile(file: File, maxChars: Int = MAX_READ_CHARS): Pair<String, Boolean> {
         return try {
-            val bytes = file.readBytes()
-            // Проверка на бинарный файл (наличие нулей в первых 1024 байтах)
-            val checkLen = bytes.size.coerceAtMost(1024)
-            for (i in 0 until checkLen) {
-                if (bytes[i] == 0.toByte()) {
-                    return Pair("⚠️ Файл '${file.name}' является бинарным и не может быть прочитан как текст.", false)
-                }
-            }
-
-            val text = String(bytes, Charsets.UTF_8)
-            if (text.length > maxChars) {
-                val truncated = text.substring(0, maxChars) + "\n\n[...файл обрезан, показаны первые $maxChars символов из ${text.length}...]"
+            val parsed = UniversalFileParser.parseFile(null, file)
+            if (parsed.content.length > maxChars) {
+                val truncated = parsed.content.substring(0, maxChars) +
+                    "\n\n[...файл обрезан, показаны первые $maxChars символов из ${parsed.content.length}...]"
                 Pair(truncated, true)
             } else {
-                Pair(text, false)
+                Pair(parsed.content, false)
             }
         } catch (e: Exception) {
             Pair("⚠️ Ошибка чтения файла '${file.name}': ${e.message}", false)
@@ -121,32 +113,49 @@ object FileStorageManager {
     }
 
     /**
-     * Автоматическое обогащение запроса содержимым найденных локальных файлов.
+     * Автоматическое обогащение запроса содержимым найденных локальных файлов любых форматов.
      */
     fun enrichPromptWithLocalFiles(prompt: String): Pair<String, List<String>> {
+        val (enriched, names, _) = enrichPromptWithLocalFilesAndImages(null, prompt)
+        return Pair(enriched, names)
+    }
+
+    fun enrichPromptWithLocalFilesAndImages(
+        context: Context?,
+        prompt: String
+    ): Triple<String, List<String>, List<String>> {
         val paths = extractFilePathsFromText(prompt)
         val loadedFiles = mutableListOf<String>()
         val loadedPaths = mutableSetOf<String>()
+        val imageDataUrls = mutableListOf<String>()
         val fileContexts = StringBuilder()
 
         for (p in paths) {
             val file = resolveLocalFile(p)
             if (file != null && loadedPaths.add(file.absolutePath)) {
-                val (content, _) = readTextFile(file)
+                val parsed = UniversalFileParser.parseFile(context, file)
                 val ext = file.extension.lowercase()
-                fileContexts.append("\n\n[Файл из памяти устройства: ${file.absolutePath} (${file.length() / 1024} КБ)]:\n")
-                fileContexts.append("```$ext\n")
-                fileContexts.append(content)
-                fileContexts.append("\n```\n")
+                fileContexts.append("\n\n[Файл из памяти устройства: ${file.absolutePath} (${UniversalFileParser.formatSize(file.length())})]:\n")
+                if (parsed.category == AttachmentCategory.TEXT) {
+                    fileContexts.append("```$ext\n")
+                    fileContexts.append(parsed.content)
+                    fileContexts.append("\n```\n")
+                } else {
+                    fileContexts.append(parsed.content)
+                    fileContexts.append("\n")
+                }
+                if (parsed.imageBase64 != null) {
+                    imageDataUrls.add("data:image/jpeg;base64,${parsed.imageBase64}")
+                }
                 loadedFiles.add(file.name)
             }
         }
 
         return if (loadedFiles.isNotEmpty()) {
             val enriched = fileContexts.toString().trim() + "\n\n" + prompt
-            Pair(enriched, loadedFiles)
+            Triple(enriched, loadedFiles, imageDataUrls)
         } else {
-            Pair(prompt, emptyList())
+            Triple(prompt, emptyList(), emptyList())
         }
     }
 

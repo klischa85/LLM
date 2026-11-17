@@ -4,13 +4,15 @@ package com.klischa.llmnotes
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
-import android.provider.OpenableColumns
+import android.util.Base64
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -24,6 +26,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -31,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.lifecycleScope
 import com.klischa.llmnotes.api.ApiChatMessage
 import com.klischa.llmnotes.api.LLMProviderType
 import com.klischa.llmnotes.api.OpenCodeClient
@@ -39,7 +45,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -48,67 +53,34 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class QuickPromptActivity : ComponentActivity() {
 
-    companion object {
-        private const val MAX_ATTACHMENT_READ_BYTES = 256 * 1024 // 256 КБ — защита от OOM
-    }
-
-    private var attachedFileName by mutableStateOf<String?>(null)
-    private var attachedFileContent by mutableStateOf<String?>(null)
-    private var attachedFileSize by mutableStateOf<Long>(0L)
+    private var attachedDoc by mutableStateOf<AttachedDoc?>(null)
 
     private val openAttachmentLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        uri?.let {
-            try {
-                var displayName = "file.txt"
-                var size = 0L
-                contentResolver.query(it, null, null, null, null)?.use { cursor ->
-                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
-                    if (cursor.moveToFirst()) {
-                        if (nameIdx != -1) displayName = cursor.getString(nameIdx) ?: displayName
-                        if (sizeIdx != -1) size = cursor.getLong(sizeIdx)
+        uri?.let { targetUri ->
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    val parsed = UniversalFileParser.parseUri(this@QuickPromptActivity, targetUri)
+                    withContext(Dispatchers.Main) {
+                        attachedDoc = parsed
+                        Toast.makeText(
+                            this@QuickPromptActivity,
+                            "${parsed.category.emoji} Прикреплён файл '${parsed.name}'",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            this@QuickPromptActivity,
+                            "Ошибка чтения файла: ${e.message}",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
                 }
-
-                val bytes = readBoundedBytes(it, MAX_ATTACHMENT_READ_BYTES)
-                val checkLen = bytes.size.coerceAtMost(1024)
-                var isBinary = false
-                for (i in 0 until checkLen) {
-                    if (bytes[i] == 0.toByte()) {
-                        isBinary = true
-                        break
-                    }
-                }
-                if (isBinary) {
-                    Toast.makeText(this, "⚠️ Бинарный файл не поддерживается для анализа", Toast.LENGTH_LONG).show()
-                } else {
-                    val text = String(bytes, Charsets.UTF_8).take(25000)
-                    attachedFileName = displayName
-                    attachedFileSize = if (size > 0) size else bytes.size.toLong()
-                    attachedFileContent = text
-                    Toast.makeText(this, "📎 Файл '$displayName' прикреплен", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                Toast.makeText(this, "Ошибка чтения файла: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
-    }
-
-    private fun readBoundedBytes(uri: Uri, maxBytes: Int): ByteArray {
-        val out = ByteArrayOutputStream()
-        contentResolver.openInputStream(uri)?.use { input ->
-            val buf = ByteArray(8192)
-            var total = 0
-            while (total < maxBytes) {
-                val read = input.read(buf, 0, minOf(buf.size, maxBytes - total))
-                if (read <= 0) break
-                out.write(buf, 0, read)
-                total += read
-            }
-        }
-        return out.toByteArray()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -121,14 +93,10 @@ class QuickPromptActivity : ComponentActivity() {
                     onAttachClick = {
                         openAttachmentLauncher.launch(arrayOf("*/*"))
                     },
-                    attachedName = attachedFileName,
-                    attachedSize = attachedFileSize,
+                    attachedDoc = attachedDoc,
                     onRemoveAttachment = {
-                        attachedFileName = null
-                        attachedFileContent = null
-                        attachedFileSize = 0L
+                        attachedDoc = null
                     },
-                    getAttachedContent = { attachedFileContent },
                     onOpenFullApp = { query ->
                         val intent = Intent(this, MainActivity::class.java).apply {
                             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -149,10 +117,8 @@ class QuickPromptActivity : ComponentActivity() {
 fun QuickPromptDialogContent(
     onDismiss: () -> Unit,
     onAttachClick: () -> Unit,
-    attachedName: String?,
-    attachedSize: Long,
+    attachedDoc: AttachedDoc?,
     onRemoveAttachment: () -> Unit,
-    getAttachedContent: () -> String?,
     onOpenFullApp: (String) -> Unit
 ) {
     val context = LocalContext.current
@@ -301,12 +267,20 @@ fun QuickPromptDialogContent(
                     )
                 }
 
-                // Превью прикрепленного файла
-                if (attachedName != null) {
+                // Превью прикреплённого файла любого формата (с миниатюрой для скриншотов/фото)
+                if (attachedDoc != null) {
+                    val previewBitmap = remember(attachedDoc.imageBase64) {
+                        attachedDoc.imageBase64?.let { b64 ->
+                            try {
+                                val bytes = Base64.decode(b64, Base64.DEFAULT)
+                                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                            } catch (_: Exception) { null }
+                        }
+                    }
                     Spacer(modifier = Modifier.height(6.dp))
                     Surface(
                         color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f),
-                        shape = RoundedCornerShape(8.dp),
+                        shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Row(
@@ -318,18 +292,38 @@ fun QuickPromptDialogContent(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.weight(1f)
                             ) {
-                                Icon(
-                                    painter = painterResource(id = R.drawable.ic_attach),
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "$attachedName (${attachedSize / 1024} КБ)",
-                                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                                    maxLines = 1
-                                )
+                                if (previewBitmap != null) {
+                                    Image(
+                                        bitmap = previewBitmap,
+                                        contentDescription = attachedDoc.name,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .size(36.dp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                    )
+                                } else {
+                                    Text(
+                                        text = attachedDoc.category.emoji,
+                                        fontSize = 18.sp
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = attachedDoc.name,
+                                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                                        maxLines = 1
+                                    )
+                                    val sub = attachedDoc.summaryBadge.ifBlank {
+                                        UniversalFileParser.formatSize(attachedDoc.sizeBytes)
+                                    }
+                                    Text(
+                                        text = sub,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1
+                                    )
+                                }
                             }
                             IconButton(onClick = onRemoveAttachment, modifier = Modifier.size(20.dp)) {
                                 Icon(Icons.Default.Close, contentDescription = "Удалить", modifier = Modifier.size(14.dp))
@@ -344,13 +338,13 @@ fun QuickPromptDialogContent(
                 OutlinedTextField(
                     value = inputText,
                     onValueChange = { inputText = it },
-                    placeholder = { Text("Введите запрос или путь к файлу...", fontSize = 13.sp) },
+                    placeholder = { Text("Введите запрос или прикрепите любой файл...", fontSize = 13.sp) },
                     trailingIcon = {
                         IconButton(onClick = onAttachClick) {
                             Icon(
                                 painter = painterResource(id = R.drawable.ic_attach),
                                 contentDescription = "Прикрепить файл",
-                                tint = if (attachedName != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                tint = if (attachedDoc != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     },
@@ -369,14 +363,19 @@ fun QuickPromptDialogContent(
                             return@Button
                         }
 
-                        if (inputText.isBlank() && attachedName == null) return@Button
+                        val currentAttached = attachedDoc
+                        if (inputText.isBlank() && currentAttached == null) return@Button
                         if (provider != LLMProviderType.LOCAL_GGUF && apiKey.isBlank()) {
                             Toast.makeText(context, "Укажите API-ключ для ${provider.displayName} в настройках приложения", Toast.LENGTH_LONG).show()
                             return@Button
                         }
 
                         val queryText = inputText.trim().ifEmpty {
-                            "Проанализируй прикреплённый файл ($attachedName)"
+                            if (currentAttached?.category == AttachmentCategory.IMAGE) {
+                                "Опиши и проанализируй это изображение (${currentAttached.name})"
+                            } else {
+                                "Проанализируй прикреплённый файл (${currentAttached?.name ?: "документ"})"
+                            }
                         }
                         cancelRequested.set(false)
                         isGenerating = true
@@ -385,12 +384,22 @@ fun QuickPromptDialogContent(
 
                         currentJob = coroutineScope.launch(Dispatchers.IO) {
                             try {
-                                val attachedContent = getAttachedContent()
-                                val filePrefix = if (attachedName != null && attachedContent != null) {
-                                    "[Прикрепленный файл: $attachedName]:\n```\n$attachedContent\n```\n\n"
+                                val imageDataUrls = mutableListOf<String>()
+                                val filePrefix = if (currentAttached != null) {
+                                    if (currentAttached.imageBase64 != null) {
+                                        imageDataUrls.add("data:image/jpeg;base64,${currentAttached.imageBase64}")
+                                    }
+                                    val sizeLabel = UniversalFileParser.formatSize(currentAttached.sizeBytes)
+                                    if (currentAttached.category == AttachmentCategory.TEXT) {
+                                        "[Прикреплённый файл: ${currentAttached.name} ($sizeLabel)]:\n```\n${currentAttached.content}\n```\n\n"
+                                    } else {
+                                        "[Прикреплённый файл: ${currentAttached.name} ($sizeLabel, ${currentAttached.mimeType})]:\n${currentAttached.content}\n\n"
+                                    }
                                 } else ""
 
-                                val (enrichedQuery, loadedFiles) = FileStorageManager.enrichPromptWithLocalFiles(queryText)
+                                val (enrichedQuery, loadedFiles, localImages) =
+                                    FileStorageManager.enrichPromptWithLocalFilesAndImages(context, queryText)
+                                imageDataUrls.addAll(localImages)
                                 val finalPrompt = filePrefix + enrichedQuery
 
                                 if (loadedFiles.isNotEmpty()) {
@@ -412,7 +421,7 @@ fun QuickPromptDialogContent(
                                     didRunInference = true
                                     val messages = listOf(
                                         ApiChatMessage("system", systemContext),
-                                        ApiChatMessage("user", finalPrompt)
+                                        ApiChatMessage("user", finalPrompt, imageDataUrls = imageDataUrls)
                                     )
                                     OpenCodeClient.streamChatCompletions(
                                         provider = provider,
@@ -511,7 +520,7 @@ fun QuickPromptDialogContent(
                     },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    enabled = isGenerating || inputText.isNotBlank() || attachedName != null,
+                    enabled = isGenerating || inputText.isNotBlank() || attachedDoc != null,
                     colors = if (isGenerating) {
                         ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                     } else {

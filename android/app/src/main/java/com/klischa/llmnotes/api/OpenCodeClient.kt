@@ -28,7 +28,8 @@ enum class LLMProviderType(val displayName: String, val baseUrl: String) {
 
 data class ApiChatMessage(
     val role: String,
-    val content: String
+    val content: String,
+    val imageDataUrls: List<String> = emptyList()
 )
 
 /**
@@ -37,7 +38,7 @@ data class ApiChatMessage(
  */
 object OpenCodeClient {
     private const val TAG = "OpenCodeClient"
-    private const val APP_USER_AGENT = "LLM-Android/1.3.6"
+    private const val APP_USER_AGENT = "LLM-Android/1.3.7"
     const val OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
 
     init {
@@ -265,6 +266,8 @@ object OpenCodeClient {
 
     /**
      * Потоковая генерация ответа через Server-Sent Events (SSE).
+     * Поддерживает мультимодальные запросы с изображениями (OpenAI Vision `image_url`)
+     * с автоматическим откатом на текстовое описание, если модель не поддерживает Vision.
      * Рассуждения (`reasoning_content` / `reasoning`) автоматически оборачиваются в `<think>...</think>`,
      * чтобы UI отображал их в аккуратной сворачиваемой карточке (ThoughtParser).
      */
@@ -276,6 +279,49 @@ object OpenCodeClient {
         messages: List<ApiChatMessage>,
         conversationId: String = "",
         temperature: Float = 0.7f,
+        onToken: (String) -> Unit,
+        isCancelled: () -> Boolean
+    ) {
+        val hasImages = messages.any { it.imageDataUrls.isNotEmpty() }
+        // Официальный DeepSeek API (/v1/chat/completions) является текстовым — отправляем без image_url
+        val allowVision = hasImages && provider != LLMProviderType.DEEPSEEK
+
+        try {
+            executeStreamRequest(
+                provider = provider,
+                apiKey = apiKey,
+                model = model,
+                messages = messages,
+                temperature = temperature,
+                includeImages = allowVision,
+                onToken = onToken,
+                isCancelled = isCancelled
+            )
+        } catch (e: VisionNotSupportedException) {
+            Log.w(TAG, "Модель '$model' (${provider.displayName}) не поддерживает Vision (${e.message}). Повторяем запрос в текстовом режиме.")
+            // Автоматический безопасный откат на текстовый формат с метаданными изображения
+            executeStreamRequest(
+                provider = provider,
+                apiKey = apiKey,
+                model = model,
+                messages = messages,
+                temperature = temperature,
+                includeImages = false,
+                onToken = onToken,
+                isCancelled = isCancelled
+            )
+        }
+    }
+
+    private class VisionNotSupportedException(message: String) : Exception(message)
+
+    private fun executeStreamRequest(
+        provider: LLMProviderType,
+        apiKey: String,
+        model: String,
+        messages: List<ApiChatMessage>,
+        temperature: Float,
+        includeImages: Boolean,
         onToken: (String) -> Unit,
         isCancelled: () -> Boolean
     ) {
@@ -325,8 +371,8 @@ object OpenCodeClient {
 
             conn.doOutput = true
             conn.connectTimeout = 20000
-            // DeepSeek Reasoner (R1) может думать дольше перед выдачей первых токенов
-            conn.readTimeout = if (isDeepSeekReasoner) 120000 else 60000
+            // DeepSeek Reasoner (R1) или мультимодальные запросы с изображениями могут думать дольше
+            conn.readTimeout = if (isDeepSeekReasoner || includeImages) 120000 else 60000
 
             val rootJson = JSONObject().apply {
                 put("model", model)
@@ -339,7 +385,24 @@ object OpenCodeClient {
                 for (m in messages) {
                     msgsArr.put(JSONObject().apply {
                         put("role", m.role)
-                        put("content", m.content)
+                        if (includeImages && m.imageDataUrls.isNotEmpty() && m.role == "user") {
+                            val parts = JSONArray()
+                            parts.put(JSONObject().apply {
+                                put("type", "text")
+                                put("text", m.content)
+                            })
+                            for (imgUrl in m.imageDataUrls) {
+                                parts.put(JSONObject().apply {
+                                    put("type", "image_url")
+                                    put("image_url", JSONObject().apply {
+                                        put("url", imgUrl)
+                                    })
+                                })
+                            }
+                            put("content", parts)
+                        } else {
+                            put("content", m.content)
+                        }
                     })
                 }
                 put("messages", msgsArr)
@@ -360,6 +423,16 @@ object OpenCodeClient {
                         ?: err
                 } catch (_: Exception) {
                     err
+                }
+
+                // Если выбранная облачная модель не поддерживает Vision / image_url — откатываемся на текст
+                if (includeImages && responseCode in listOf(400, 404, 415, 422)) {
+                    val low = cleanErr.lowercase()
+                    if (low.contains("image") || low.contains("vision") || low.contains("multimodal") ||
+                        low.contains("content") || low.contains("unsupported") || low.contains("array")
+                    ) {
+                        throw VisionNotSupportedException(cleanErr)
+                    }
                 }
 
                 val tip = when (responseCode) {
