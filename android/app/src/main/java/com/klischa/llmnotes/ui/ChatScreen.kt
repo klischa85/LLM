@@ -93,6 +93,7 @@ fun ChatScreen(
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val coroutineScope = rememberCoroutineScope()
     var chatSearchQuery by remember { mutableStateOf("") }
+    var showModelStore by remember { mutableStateOf(false) }
 
     // Диалог настройки провайдеров (DeepSeek, OpenRouter, Groq, OpenCode GO/ZEN, локальный GGUF)
     if (uiState.isProviderDialogVisible) {
@@ -111,6 +112,14 @@ fun ChatScreen(
             onRequestTermuxPermissionClick = onRequestTermuxPermissionClick,
             onOpenStoragePermissionClick = onOpenStoragePermissionClick,
             onDismiss = { viewModel.setAgentDialogVisible(false) }
+        )
+    }
+
+    // Каталог моделей: скачивание GGUF прямо из приложения
+    if (showModelStore) {
+        ModelStoreDialog(
+            onDismiss = { showModelStore = false },
+            onModelReady = { path -> viewModel.loadModel(path) }
         )
     }
 
@@ -315,6 +324,13 @@ fun ChatScreen(
                                 contentDescription = "Системный промпт",
                                 tint = if (uiState.isSystemPromptExpanded) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
                             )
+                        }
+
+                        // Каталог моделей (скачать GGUF из интернета)
+                        if (uiState.providerType == LLMProviderType.LOCAL_GGUF) {
+                            IconButton(onClick = { showModelStore = true }) {
+                                Text(text = "\u2B07\uFE0F", fontSize = 16.sp)
+                            }
                         }
 
                         // Выбор GGUF модели (только в локальном режиме)
