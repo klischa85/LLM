@@ -2,6 +2,7 @@ package com.klischa.llmnotes.browser
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.MutableContextWrapper
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.net.Uri
@@ -9,6 +10,7 @@ import android.os.Environment
 import android.util.Base64
 import android.util.Log
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -17,6 +19,7 @@ import android.webkit.WebSettings
 import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -159,10 +162,13 @@ object AgentBrowserEngine {
     private val actionMutex = Mutex()
 
     @Volatile
-    private var attachedWebView: WebView? = null
+    private var sharedWebView: WebView? = null
 
     @Volatile
-    private var fallbackWebView: WebView? = null
+    private var webViewContextWrapper: MutableContextWrapper? = null
+
+    @Volatile
+    private var appContextRef: Context? = null
 
     @Volatile
     private var pageLoadDeferred: CompletableDeferred<String?>? = null
@@ -171,8 +177,20 @@ object AgentBrowserEngine {
     private var lastIndexedElements: Map<Int, BrowserElementInfo> = emptyMap()
 
     // =========================================================================
-    // Жизненный цикл и конфигурация WebView
+    // Жизненный цикл и конфигурация WebView (единый ленивый экземпляр без утечек)
     // =========================================================================
+
+    /**
+     * Инициализирует сохранённые настройки при старте приложения без создания WebView / CookieManager.
+     */
+    fun initSettings(engine: BrowserSearchEngine, incognito: Boolean) {
+        _state.update {
+            it.copy(
+                searchEngine = engine,
+                incognitoMode = incognito
+            )
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     fun configureWebView(webView: WebView) {
@@ -279,21 +297,67 @@ object AgentBrowserEngine {
         }
     }
 
-    fun attachWebView(webView: WebView) {
-        attachedWebView = webView
-        configureWebView(webView)
-        // Если ранее открывали страницу в fallbackWebView — перенесём текущий URL в UI WebView
-        val prevUrl = _state.value.currentUrl
-        if (prevUrl.startsWith("http://") || prevUrl.startsWith("https://")) {
-            if (webView.url.isNullOrBlank()) {
-                webView.loadUrl(prevUrl)
-            }
-        }
+    /**
+     * Лениво создаёт единственный живой WebView (на главном потоке) с MutableContextWrapper.
+     */
+    private fun getOrCreateWebViewOnMain(context: Context): WebView {
+        val appCtx = context.applicationContext
+        appContextRef = appCtx
+        sharedWebView?.let { return it }
+
+        val wrapper = MutableContextWrapper(appCtx)
+        webViewContextWrapper = wrapper
+        val wv = WebView(wrapper)
+        configureWebView(wv)
+        val w = 1080
+        val h = 1920
+        wv.measure(
+            View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY)
+        )
+        wv.layout(0, 0, w, h)
+        sharedWebView = wv
+        return wv
     }
 
-    fun detachWebView(webView: WebView) {
-        if (attachedWebView === webView) {
-            attachedWebView = null
+    /**
+     * Присоединяет единственный живой WebView к открытому окну браузера в UI (без перезагрузки страницы!).
+     */
+    fun attachToHost(container: FrameLayout, uiContext: Context): WebView {
+        val wv = getOrCreateWebViewOnMain(uiContext)
+        // Переключаем контекст на Activity для корректной работы клавиатуры IME и выпадающих списков
+        webViewContextWrapper?.baseContext = uiContext
+        (wv.parent as? ViewGroup)?.removeView(wv)
+        wv.visibility = View.VISIBLE
+        wv.layoutParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        container.addView(wv)
+        try {
+            wv.onResume()
+        } catch (_: Exception) {}
+        return wv
+    }
+
+    /**
+     * Отсоединяет WebView при сворачивании окна браузера: НЕ уничтожает страницу и освобождает ссылку на Activity.
+     */
+    fun detachFromHost(container: FrameLayout) {
+        val wv = sharedWebView ?: return
+        if (wv.parent === container) {
+            container.removeView(wv)
+        }
+        // Сбрасываем контекст обратно на applicationContext, чтобы Activity никогда не утекала
+        appContextRef?.let { webViewContextWrapper?.baseContext = it }
+        if (wv.width <= 0 || wv.height <= 0) {
+            val w = 1080
+            val h = 1920
+            wv.measure(
+                View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY)
+            )
+            wv.layout(0, 0, w, h)
         }
     }
 
@@ -316,7 +380,7 @@ object AgentBrowserEngine {
     fun setIncognitoMode(enabled: Boolean) {
         val wasIncognito = _state.value.incognitoMode
         _state.update { it.copy(incognitoMode = enabled) }
-        val wv = attachedWebView ?: fallbackWebView
+        val wv = sharedWebView
         if (wv != null) {
             wv.post {
                 wv.settings.cacheMode = if (enabled) WebSettings.LOAD_NO_CACHE else WebSettings.LOAD_DEFAULT
@@ -332,7 +396,7 @@ object AgentBrowserEngine {
 
     fun setDesktopMode(enabled: Boolean) {
         _state.update { it.copy(desktopMode = enabled) }
-        val wv = attachedWebView ?: fallbackWebView ?: return
+        val wv = sharedWebView ?: return
         wv.post {
             wv.settings.userAgentString = if (enabled) DESKTOP_UA else MOBILE_UA
             if (!wv.url.isNullOrBlank() && wv.url != "about:blank") {
@@ -342,7 +406,7 @@ object AgentBrowserEngine {
     }
 
     fun clearBrowsingData() {
-        val wv = attachedWebView ?: fallbackWebView
+        val wv = sharedWebView
         if (wv != null) {
             wv.post { clearDataOnMainThread(wv) }
         } else {
@@ -384,28 +448,29 @@ object AgentBrowserEngine {
     // Ручное управление из интерфейса встроенного браузера
     // =========================================================================
 
-    fun navigateUser(rawInput: String) {
+    fun navigateUser(context: Context, rawInput: String) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return
         val targetUrl = normalizeUserInputToUrl(trimmed, _state.value.searchEngine) ?: return
-        val wv = attachedWebView ?: fallbackWebView ?: return
+        val wv = sharedWebView ?: getOrCreateWebViewOnMain(context)
+        _state.update { it.copy(currentUrl = targetUrl, isLoading = true, progress = 10, lastError = null) }
         wv.post {
             wv.loadUrl(targetUrl)
         }
     }
 
     fun goBackUser() {
-        val wv = attachedWebView ?: fallbackWebView ?: return
+        val wv = sharedWebView ?: return
         wv.post { if (wv.canGoBack()) wv.goBack() }
     }
 
     fun goForwardUser() {
-        val wv = attachedWebView ?: fallbackWebView ?: return
+        val wv = sharedWebView ?: return
         wv.post { if (wv.canGoForward()) wv.goForward() }
     }
 
     fun reloadOrStopUser() {
-        val wv = attachedWebView ?: fallbackWebView ?: return
+        val wv = sharedWebView ?: return
         wv.post {
             if (_state.value.isLoading) {
                 wv.stopLoading()
@@ -926,22 +991,9 @@ object AgentBrowserEngine {
     }
 
     private suspend fun ensureWebView(context: Context): WebView {
-        attachedWebView?.let { return it }
-        fallbackWebView?.let { return it }
+        sharedWebView?.let { return it }
         return withContext(Dispatchers.Main) {
-            attachedWebView?.let { return@withContext it }
-            fallbackWebView?.let { return@withContext it }
-            val wv = WebView(context.applicationContext)
-            configureWebView(wv)
-            val w = 1080
-            val h = 1920
-            wv.measure(
-                View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY)
-            )
-            wv.layout(0, 0, w, h)
-            fallbackWebView = wv
-            wv
+            getOrCreateWebViewOnMain(context)
         }
     }
 

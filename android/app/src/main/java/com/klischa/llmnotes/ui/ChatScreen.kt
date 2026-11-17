@@ -548,20 +548,21 @@ fun ChatScreen(
         }
         }
 
-        // Полноценный встроенный интерактивный браузер агента (живой WebView, мгновенное открытие/сворачивание)
-        AgentBrowserOverlay(
-            visible = uiState.isBrowserVisible,
-            browserState = browserState,
-            isAgentGenerating = uiState.isGenerating,
-            onClose = { viewModel.setBrowserVisible(false) },
-            onStopAgent = { viewModel.stopGeneration() },
-            onSelectSearchEngine = { viewModel.setBrowserSearchEngine(it) },
-            onToggleIncognito = { viewModel.setBrowserIncognitoMode(it) },
-            onToggleDesktopMode = { viewModel.setBrowserDesktopMode(it) },
-            onClearCookies = { viewModel.clearBrowserData() },
-            onAttachScreenshotToChat = { viewModel.attachBrowserScreenshotToChat() },
-            onAttachTextToChat = { viewModel.attachBrowserTextToChat() }
-        )
+        // Полноценный встроенный интерактивный браузер агента (монтируется ТОЛЬКО при открытии!)
+        if (uiState.isBrowserVisible) {
+            AgentBrowserOverlay(
+                browserState = browserState,
+                isAgentGenerating = uiState.isGenerating,
+                onClose = { viewModel.setBrowserVisible(false) },
+                onStopAgent = { viewModel.stopGeneration() },
+                onSelectSearchEngine = { viewModel.setBrowserSearchEngine(it) },
+                onToggleIncognito = { viewModel.setBrowserIncognitoMode(it) },
+                onToggleDesktopMode = { viewModel.setBrowserDesktopMode(it) },
+                onClearCookies = { viewModel.clearBrowserData() },
+                onAttachScreenshotToChat = { viewModel.attachBrowserScreenshotToChat() },
+                onAttachTextToChat = { viewModel.attachBrowserTextToChat() }
+            )
+        }
     }
 }
 

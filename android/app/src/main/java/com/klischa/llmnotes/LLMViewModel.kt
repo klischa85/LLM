@@ -348,8 +348,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         val savedEngineStr = prefs.getString(PREF_BROWSER_SEARCH_ENGINE, BrowserSearchEngine.DUCKDUCKGO.id)
         val browserEngine = BrowserSearchEngine.fromString(savedEngineStr) ?: BrowserSearchEngine.DUCKDUCKGO
         val browserIncognito = prefs.getBoolean(PREF_BROWSER_INCOGNITO, false)
-        AgentBrowserEngine.setSearchEngine(browserEngine)
-        AgentBrowserEngine.setIncognitoMode(browserIncognito)
+        AgentBrowserEngine.initSettings(browserEngine, browserIncognito)
 
         val termuxStatus = TermuxBridge.checkStatus(app)
 
