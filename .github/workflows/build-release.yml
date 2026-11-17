@@ -25,78 +25,78 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Gradle
+      - name: Setup Gradle 8.6
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.6'
           cache-disabled: true
 
-      - name: Clone llama.cpp source
+      - name: Clone and patch llama.cpp (b3600)
         run: |
           git clone --depth 1 --branch b3600 https://github.com/ggerganov/llama.cpp.git android/app/src/main/cpp/llama_cpp
           python3 scripts/patch_llama_cpp.py android/app/src/main/cpp/llama_cpp
 
-      - name: Configure Android SDK and Accept Licenses
+      - name: Configure Android SDK, NDK, and CMake
         run: |
           echo "sdk.dir=${ANDROID_HOME}" > android/local.properties
-          yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          if [ -d "${ANDROID_HOME}/ndk/26.1.10909125" ]; then
-            echo "ndk.dir=${ANDROID_HOME}/ndk/26.1.10909125" >> android/local.properties
-            echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/26.1.10909125" >> $GITHUB_ENV
-          else
-            yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" || true
-            if [ -d "${ANDROID_HOME}/ndk/26.1.10909125" ]; then
-              echo "ndk.dir=${ANDROID_HOME}/ndk/26.1.10909125" >> android/local.properties
-              echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/26.1.10909125" >> $GITHUB_ENV
-            fi
-          fi
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.1.10909125" \
+            "cmake;3.22.1"
 
-      - name: Make gradlew executable
-        run: |
-          chmod +x android/gradlew || true
-
-      - name: Build APK with Gradle
+      - name: Build Release APK with Gradle
         working-directory: ./android
         run: |
           set -o pipefail
-          ./gradlew :app:assembleRelease --stacktrace 2>&1 | tee build.log || {
-            echo "Release build failed, running debug build..."
-            ./gradlew :app:assembleDebug --stacktrace 2>&1 | tee build.log || {
-              echo "=== GRADLE BUILD FAILED ==="
-              grep -E "error:|FAILED|exception|Exception" build.log | tail -n 40 | while IFS= read -r line; do
-                echo "::error title=BuildError::$line"
-              done
-              tail -n 25 build.log | while IFS= read -r line; do
-                echo "::error title=GradleTail::$line"
-              done
-              exit 1
-            }
+          gradle :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log || {
+            echo "=== GRADLE BUILD FAILED ==="
+            grep -E "error:|FAILED|exception|Exception" build.log | tail -n 40 | while IFS= read -r line; do
+              echo "::error title=BuildError::$line"
+            done
+            tail -n 25 build.log | while IFS= read -r line; do
+              echo "::error title=GradleTail::$line"
+            done
+            exit 1
           }
 
-      - name: Locate APK files
+      - name: Package versioned APK and SHA-256
         id: find_apk
         run: |
-          echo "Listing all generated APK files:"
-          find . -name "*.apk" -type f
-          APK_PATH=$(find . -name "*release*.apk" -type f | head -n 1)
-          if [ -z "$APK_PATH" ]; then
-            APK_PATH=$(find . -name "*.apk" -type f | head -n 1)
-          fi
-          if [ -z "$APK_PATH" ]; then
-            echo "::error::No APK file found in build outputs!"
-            find android/app/build -maxdepth 5 || true
+          RAW_APK=$(find android/app/build/outputs/apk/release -name "*.apk" -type f | head -n 1)
+          if [ -z "$RAW_APK" ]; then
+            echo "::error::No release APK file found in build outputs!"
+            find android/app/build/outputs -maxdepth 4 || true
             exit 1
           fi
-          echo "Found APK: $APK_PATH"
-          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
-          sha256sum "$APK_PATH" > "${APK_PATH}.sha256"
-          echo "apk_sha256=${APK_PATH}.sha256" >> $GITHUB_OUTPUT
+
+          VERSION_TAG="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            VERSION_TAG="v$(grep -oE 'versionName\s*=\s*"[^"]+"' android/app/build.gradle.kts | head -n 1 | cut -d'"' -f2)"
+          fi
+
+          mkdir -p release-dist
+          OUT_APK="release-dist/LLMNotes-${VERSION_TAG}.apk"
+          cp "$RAW_APK" "$OUT_APK"
+          (cd release-dist && sha256sum "LLMNotes-${VERSION_TAG}.apk" > "LLMNotes-${VERSION_TAG}.apk.sha256")
+
+          echo "Built asset: $OUT_APK"
+          ls -lh release-dist/
+          cat "release-dist/LLMNotes-${VERSION_TAG}.apk.sha256"
+
+          echo "apk_path=$OUT_APK" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=${OUT_APK}.sha256" >> "$GITHUB_OUTPUT"
+          echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LLMNotes-APK
-          path: ${{ steps.find_apk.outputs.apk_path }}
+          name: LLMNotes-${{ steps.find_apk.outputs.version_tag }}
+          path: |
+            ${{ steps.find_apk.outputs.apk_path }}
+            ${{ steps.find_apk.outputs.apk_sha256 }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -106,6 +106,7 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             ${{ steps.find_apk.outputs.apk_path }}
             ${{ steps.find_apk.outputs.apk_sha256 }}
