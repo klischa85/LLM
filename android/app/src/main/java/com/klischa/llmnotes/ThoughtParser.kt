@@ -37,9 +37,13 @@ object ThoughtParser {
             }
         }
         text = text.trimEnd()
-        // Устраняем висячие служебные префиксы в самом конце текста
-        while (text.endsWith("<") || text.endsWith("|") || text.endsWith("｜")) {
-            text = text.dropLast(1).trimEnd()
+        // Устраняем висячие служебные префиксы тегов в самом конце текста (не повреждая Markdown-таблицы)
+        while (text.endsWith("<|") || text.endsWith("<｜") || text.endsWith("<")) {
+            text = when {
+                text.endsWith("<|") -> text.dropLast(2).trimEnd()
+                text.endsWith("<｜") -> text.dropLast(2).trimEnd()
+                else -> text.dropLast(1).trimEnd()
+            }
         }
         return text
     }
@@ -48,7 +52,7 @@ object ThoughtParser {
      * Разделяет рассуждения модели (<think>...</think>) и окончательный ответ пользователю
      */
     fun parse(rawText: String, isStreaming: Boolean = false): ParsedMessage {
-        val cleaned = cleanStopTokens(rawText)
+        val cleaned = cleanStopTokens(rawText).trimStart()
 
         // Случай 1: Присутствует закрывающий тег </think> (модель завершила рассуждения и выдала ответ)
         if (cleaned.contains("</think>")) {

@@ -1,5 +1,6 @@
 package com.klischa.llmnotes
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -15,11 +16,17 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.ViewModelProvider
 import com.klischa.llmnotes.ui.ChatScreen
 import com.klischa.llmnotes.ui.LLMNotesTheme
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var viewModel: LLMViewModel
+
+    companion object {
+        const val EXTRA_PREFILL_PROMPT = "extra_prefill_prompt"
+        private const val MAX_ATTACHMENT_READ_BYTES = 256 * 1024 // 256 КБ — защита от OOM
+    }
 
     // Лаунчер выбора файла .gguf из проводника Android
     private val openDocumentLauncher = registerForActivityResult(
@@ -44,7 +51,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Лаунчер выбора текстового файла (скрепка в чате)
+    // Лаунчер выбора текстового файла (скрепка в чате) с защитой от OOM
     private val openAttachmentLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -62,13 +69,20 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val directPath = getRealPathFromUri(it)
-                val bytes = contentResolver.openInputStream(it)?.use { input -> input.readBytes() } ?: ByteArray(0)
-                val isBinary = bytes.take(1024).any { b -> b == 0.toByte() }
+                val bytes = readBoundedBytes(it, MAX_ATTACHMENT_READ_BYTES)
+                val checkLen = bytes.size.coerceAtMost(1024)
+                var isBinary = false
+                for (i in 0 until checkLen) {
+                    if (bytes[i] == 0.toByte()) {
+                        isBinary = true
+                        break
+                    }
+                }
                 if (isBinary) {
                     Toast.makeText(this, "⚠️ Бинарный файл не поддерживается для анализа", Toast.LENGTH_LONG).show()
                 } else {
                     val text = String(bytes, Charsets.UTF_8).take(25000)
-                    viewModel.attachFile(displayName, size, text, directPath)
+                    viewModel.attachFile(displayName, if (size > 0) size else bytes.size.toLong(), text, directPath)
                     Toast.makeText(this, "📎 Файл '$displayName' прикреплен к запросу", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
@@ -95,11 +109,14 @@ class MainActivity : ComponentActivity() {
         // 1. Запрос доступа к медиафайлам (для работы с фото/видео)
         requestMediaPermissions()
 
-        // 2. Запрос разрешения доступа ко всем файлам для прямого zero-copy чтения моделей
-        checkAndRequestAllFilesAccess()
+        // 2. Однократный запрос доступа ко всем файлам (не навязываем на каждом запуске)
+        checkAndRequestAllFilesAccessOnce()
 
-        // 3. Автоматическая загрузка последней выбранной модели
+        // 3. Автоматическая загрузка локальной GGUF модели только в локальном режиме
         viewModel.tryAutoLoadLastModel()
+
+        // 4. Поддержка передачи текста из виджета быстрого запроса
+        handleIncomingIntent(intent)
 
         setContent {
             LLMNotesTheme {
@@ -114,6 +131,35 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        val prefill = intent?.getStringExtra(EXTRA_PREFILL_PROMPT)?.trim()
+        if (!prefill.isNullOrEmpty()) {
+            viewModel.updateInputText(prefill)
+            intent.removeExtra(EXTRA_PREFILL_PROMPT)
+        }
+    }
+
+    private fun readBoundedBytes(uri: Uri, maxBytes: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        contentResolver.openInputStream(uri)?.use { input ->
+            val buf = ByteArray(8192)
+            var total = 0
+            while (total < maxBytes) {
+                val read = input.read(buf, 0, minOf(buf.size, maxBytes - total))
+                if (read <= 0) break
+                out.write(buf, 0, read)
+                total += read
+            }
+        }
+        return out.toByteArray()
     }
 
     private fun requestMediaPermissions() {
@@ -133,20 +179,21 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {}
     }
 
-    private fun checkAndRequestAllFilesAccess() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!Environment.isExternalStorageManager()) {
-                try {
-                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                    startActivity(intent)
-                } catch (_: Exception) {
-                    try {
-                        val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                        startActivity(intent)
-                    } catch (_: Exception) {}
+    private fun checkAndRequestAllFilesAccessOnce() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            val prefs = getSharedPreferences("llm_app_prefs", Context.MODE_PRIVATE)
+            if (prefs.getBoolean("asked_all_files_access", false)) return
+            prefs.edit().putBoolean("asked_all_files_access", true).apply()
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:$packageName")
                 }
+                startActivity(intent)
+            } catch (_: Exception) {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    startActivity(intent)
+                } catch (_: Exception) {}
             }
         }
     }

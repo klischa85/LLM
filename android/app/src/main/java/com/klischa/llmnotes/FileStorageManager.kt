@@ -126,11 +126,12 @@ object FileStorageManager {
     fun enrichPromptWithLocalFiles(prompt: String): Pair<String, List<String>> {
         val paths = extractFilePathsFromText(prompt)
         val loadedFiles = mutableListOf<String>()
+        val loadedPaths = mutableSetOf<String>()
         val fileContexts = StringBuilder()
 
         for (p in paths) {
             val file = resolveLocalFile(p)
-            if (file != null && !loadedFiles.contains(file.absolutePath)) {
+            if (file != null && loadedPaths.add(file.absolutePath)) {
                 val (content, _) = readTextFile(file)
                 val ext = file.extension.lowercase()
                 fileContexts.append("\n\n[Файл из памяти устройства: ${file.absolutePath} (${file.length() / 1024} КБ)]:\n")
@@ -208,13 +209,18 @@ object FileStorageManager {
             downloadsDir.mkdirs()
         }
 
-        val filename = if (!suggestedName.isNullOrBlank() && suggestedName.contains(".")) {
+        val rawName = if (!suggestedName.isNullOrBlank() && suggestedName.contains(".")) {
             suggestedName
         } else {
             generateDefaultFilename(language ?: "python", 1)
         }
+        // Защита от path traversal и недопустимых символов в имени файла
+        val safeName = File(rawName).name
+            .replace(Regex("""[^a-zA-Z0-9._\-]"""), "_")
+            .trimStart('.')
+            .ifBlank { generateDefaultFilename(language ?: "python", 1) }
 
-        val targetFile = File(downloadsDir, filename)
+        val targetFile = File(downloadsDir, safeName)
         targetFile.writeText(code, Charsets.UTF_8)
 
         // Оповещаем систему о новом файле, чтобы он сразу появился в Downloads

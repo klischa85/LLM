@@ -11,34 +11,26 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Send
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.lifecycle.lifecycleScope
 import com.klischa.llmnotes.api.ApiChatMessage
 import com.klischa.llmnotes.api.LLMProviderType
 import com.klischa.llmnotes.api.OpenCodeClient
@@ -47,12 +39,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Компактное окно быстрого ввода запроса (Quick Prompt) поверх рабочего стола.
  * Вызывается по клику на виджет, генерирует ответ и обновляет виджет на рабочем столе.
  */
 class QuickPromptActivity : ComponentActivity() {
+
+    companion object {
+        private const val MAX_ATTACHMENT_READ_BYTES = 256 * 1024 // 256 КБ — защита от OOM
+    }
 
     private var attachedFileName by mutableStateOf<String?>(null)
     private var attachedFileContent by mutableStateOf<String?>(null)
@@ -74,14 +72,21 @@ class QuickPromptActivity : ComponentActivity() {
                     }
                 }
 
-                val bytes = contentResolver.openInputStream(it)?.use { input -> input.readBytes() } ?: ByteArray(0)
-                val isBinary = bytes.take(1024).any { b -> b == 0.toByte() }
+                val bytes = readBoundedBytes(it, MAX_ATTACHMENT_READ_BYTES)
+                val checkLen = bytes.size.coerceAtMost(1024)
+                var isBinary = false
+                for (i in 0 until checkLen) {
+                    if (bytes[i] == 0.toByte()) {
+                        isBinary = true
+                        break
+                    }
+                }
                 if (isBinary) {
                     Toast.makeText(this, "⚠️ Бинарный файл не поддерживается для анализа", Toast.LENGTH_LONG).show()
                 } else {
                     val text = String(bytes, Charsets.UTF_8).take(25000)
                     attachedFileName = displayName
-                    attachedFileSize = size
+                    attachedFileSize = if (size > 0) size else bytes.size.toLong()
                     attachedFileContent = text
                     Toast.makeText(this, "📎 Файл '$displayName' прикреплен", Toast.LENGTH_SHORT).show()
                 }
@@ -89,6 +94,21 @@ class QuickPromptActivity : ComponentActivity() {
                 Toast.makeText(this, "Ошибка чтения файла: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
+    }
+
+    private fun readBoundedBytes(uri: Uri, maxBytes: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        contentResolver.openInputStream(uri)?.use { input ->
+            val buf = ByteArray(8192)
+            var total = 0
+            while (total < maxBytes) {
+                val read = input.read(buf, 0, minOf(buf.size, maxBytes - total))
+                if (read <= 0) break
+                out.write(buf, 0, read)
+                total += read
+            }
+        }
+        return out.toByteArray()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -112,6 +132,9 @@ class QuickPromptActivity : ComponentActivity() {
                     onOpenFullApp = { query ->
                         val intent = Intent(this, MainActivity::class.java).apply {
                             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                            if (query.isNotBlank()) {
+                                putExtra(MainActivity.EXTRA_PREFILL_PROMPT, query.trim())
+                            }
                         }
                         startActivity(intent)
                         finish()
@@ -140,6 +163,7 @@ fun QuickPromptDialogContent(
     var isGenerating by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("") }
     var currentJob by remember { mutableStateOf<Job?>(null) }
+    val cancelRequested = remember { AtomicBoolean(false) }
 
     // Чтение настроек провайдера из SharedPreferences
     val prefs = remember { context.getSharedPreferences("llm_app_prefs", Context.MODE_PRIVATE) }
@@ -147,6 +171,7 @@ fun QuickPromptDialogContent(
     val provider = try { LLMProviderType.valueOf(providerStr ?: "") } catch (_: Exception) { LLMProviderType.LOCAL_GGUF }
 
     val modelName = when (provider) {
+        LLMProviderType.DEEPSEEK -> prefs.getString("deepseek_model", "deepseek-chat") ?: "deepseek-chat"
         LLMProviderType.OPENROUTER -> prefs.getString("openrouter_model", "google/gemini-2.0-flash-exp:free") ?: "OpenRouter Free"
         LLMProviderType.GROQ -> prefs.getString("groq_model", "llama-3.3-70b-versatile") ?: "Groq Free"
         LLMProviderType.OPENCODE_ZEN -> prefs.getString("opencode_model_zen", "qwen3.6-plus") ?: "OpenCode ZEN"
@@ -155,11 +180,37 @@ fun QuickPromptDialogContent(
     }
 
     val apiKey = when (provider) {
+        LLMProviderType.DEEPSEEK -> prefs.getString("deepseek_key", "") ?: ""
         LLMProviderType.OPENROUTER -> prefs.getString("openrouter_key", "") ?: ""
         LLMProviderType.GROQ -> prefs.getString("groq_key", "") ?: ""
-        LLMProviderType.OPENCODE_ZEN -> prefs.getString("opencode_zen_key", "") ?: ""
-        LLMProviderType.OPENCODE_GO -> prefs.getString("opencode_go_key", "") ?: ""
+        LLMProviderType.OPENCODE_ZEN -> prefs.getString("opencode_zen_key", null)
+            ?: prefs.getString("opencode_api_key", "") ?: ""
+        LLMProviderType.OPENCODE_GO -> prefs.getString("opencode_go_key", null)
+            ?: prefs.getString("opencode_api_key", "") ?: ""
         LLMProviderType.LOCAL_GGUF -> ""
+    }
+
+    val stopCurrentGeneration = {
+        cancelRequested.set(true)
+        if (provider == LLMProviderType.LOCAL_GGUF) {
+            LlamaBridge.stopGeneration()
+        }
+        currentJob?.cancel()
+        currentJob = null
+        isGenerating = false
+        statusText = "Остановлено"
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            if (isGenerating) {
+                cancelRequested.set(true)
+                if (provider == LLMProviderType.LOCAL_GGUF) {
+                    LlamaBridge.stopGeneration()
+                }
+                currentJob?.cancel()
+            }
+        }
     }
 
     // Извлеченные блоки кода для кнопок скачивания и копирования
@@ -168,7 +219,10 @@ fun QuickPromptDialogContent(
     }
 
     Dialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            if (isGenerating) stopCurrentGeneration()
+            onDismiss()
+        },
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Card(
@@ -213,7 +267,13 @@ fun QuickPromptDialogContent(
                             )
                         }
                     }
-                    IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                    IconButton(
+                        onClick = {
+                            if (isGenerating) stopCurrentGeneration()
+                            onDismiss()
+                        },
+                        modifier = Modifier.size(32.dp)
+                    ) {
                         Icon(Icons.Default.Close, contentDescription = "Закрыть")
                     }
                 }
@@ -222,7 +282,9 @@ fun QuickPromptDialogContent(
 
                 // Быстрые чипы телеметрии
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     SuggestionChip(
@@ -252,7 +314,10 @@ fun QuickPromptDialogContent(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
                                 Icon(
                                     painter = painterResource(id = R.drawable.ic_attach),
                                     contentDescription = null,
@@ -296,29 +361,35 @@ fun QuickPromptDialogContent(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Кнопка отправки
+                // Кнопка отправки / остановки (исправлено: активна при генерации для реальной отмены!)
                 Button(
                     onClick = {
-                        if (inputText.isBlank() && attachedName == null) return@Button
-                        if (provider != LLMProviderType.LOCAL_GGUF && apiKey.isBlank()) {
-                            Toast.makeText(context, "Укажите API-ключ в настройках приложения", Toast.LENGTH_LONG).show()
+                        if (isGenerating) {
+                            stopCurrentGeneration()
                             return@Button
                         }
 
-                        val queryText = inputText
+                        if (inputText.isBlank() && attachedName == null) return@Button
+                        if (provider != LLMProviderType.LOCAL_GGUF && apiKey.isBlank()) {
+                            Toast.makeText(context, "Укажите API-ключ для ${provider.displayName} в настройках приложения", Toast.LENGTH_LONG).show()
+                            return@Button
+                        }
+
+                        val queryText = inputText.trim().ifEmpty {
+                            "Проанализируй прикреплённый файл ($attachedName)"
+                        }
+                        cancelRequested.set(false)
                         isGenerating = true
                         responseText = ""
                         statusText = "Генерация ответа..."
 
                         currentJob = coroutineScope.launch(Dispatchers.IO) {
                             try {
-                                // 1. Проверка вложенного файла или путей в памяти
                                 val attachedContent = getAttachedContent()
                                 val filePrefix = if (attachedName != null && attachedContent != null) {
                                     "[Прикрепленный файл: $attachedName]:\n```\n$attachedContent\n```\n\n"
                                 } else ""
 
-                                // Обогащение запроса путями из памяти
                                 val (enrichedQuery, loadedFiles) = FileStorageManager.enrichPromptWithLocalFiles(queryText)
                                 val finalPrompt = filePrefix + enrichedQuery
 
@@ -328,16 +399,17 @@ fun QuickPromptDialogContent(
                                     }
                                 }
 
-                                // 2. Обогащение системной телеметрией
                                 val systemContext = if (DeviceTools.isDeviceQuery(queryText)) {
                                     DeviceTools.buildTelemetryContext(context)
                                 } else {
                                     "Ты — краткий, умный и точный русскоязычный персональный ассистент."
                                 }
 
-                                // 3. Инференс
                                 val responseBuilder = StringBuilder()
+                                var didRunInference = false
+
                                 if (provider != LLMProviderType.LOCAL_GGUF) {
+                                    didRunInference = true
                                     val messages = listOf(
                                         ApiChatMessage("system", systemContext),
                                         ApiChatMessage("user", finalPrompt)
@@ -349,16 +421,24 @@ fun QuickPromptDialogContent(
                                         messages = messages,
                                         onToken = { token ->
                                             responseBuilder.append(token)
-                                            val cur = responseBuilder.toString()
+                                            val cur = ThoughtParser.cleanStopTokens(responseBuilder.toString())
+                                            val parsed = ThoughtParser.parse(cur, isStreaming = true)
+                                            val preview = if (parsed.answerText.isNotBlank()) {
+                                                parsed.answerText
+                                            } else if (parsed.isStillThinking || parsed.thinkingText != null) {
+                                                "💭 Размышляет..."
+                                            } else {
+                                                cur
+                                            }
                                             coroutineScope.launch(Dispatchers.Main) {
-                                                responseText = cur
+                                                responseText = preview
                                             }
                                         },
-                                        isCancelled = { !isGenerating }
+                                        isCancelled = { cancelRequested.get() }
                                     )
                                 } else {
-                                    // Локальный инференс через LlamaBridge
                                     if (LlamaBridge.isModelLoaded) {
+                                        didRunInference = true
                                         val formatted = LlamaBridge.nativeFormatChat(
                                             arrayOf("system", "user"),
                                             arrayOf(systemContext, finalPrompt)
@@ -373,8 +453,8 @@ fun QuickPromptDialogContent(
                                                     break
                                                 }
                                             }
-                                            val cur = responseBuilder.toString()
-                                            val parsed = ThoughtParser.parse(cur, true)
+                                            val cur = ThoughtParser.cleanStopTokens(responseBuilder.toString())
+                                            val parsed = ThoughtParser.parse(cur, isStreaming = true)
                                             val preview = if (parsed.answerText.isNotBlank()) parsed.answerText else "💭 Размышляет..."
                                             coroutineScope.launch(Dispatchers.Main) {
                                                 responseText = preview
@@ -389,43 +469,65 @@ fun QuickPromptDialogContent(
                                         )
                                     } else {
                                         withContext(Dispatchers.Main) {
-                                            responseText = "⚠️ Локальная модель GGUF не загружена в память.\nОткройте приложение LLM и выберите модель GGUF, либо переключитесь на бесплатные облачные провайдеры (Groq / OpenRouter)."
+                                            isGenerating = false
+                                            statusText = "Модель не загружена"
+                                            responseText = "⚠️ Локальная модель GGUF не загружена в память.\nОткройте приложение LLM и выберите модель GGUF, либо переключитесь на облачные провайдеры (DeepSeek / Groq / OpenRouter)."
                                         }
                                     }
                                 }
 
-                                val parsedFinal = ThoughtParser.parse(responseBuilder.toString(), false)
-                                val finalResp = if (parsedFinal.answerText.isNotBlank()) parsedFinal.answerText else (parsedFinal.thinkingText ?: "")
-                                withContext(Dispatchers.Main) {
-                                    isGenerating = false
-                                    statusText = "Готово"
-                                    // Обновляем виджет на рабочем столе полученным ответом
-                                    LLMWidgetProvider.updateAllWidgets(
-                                        context = context,
-                                        query = queryText,
-                                        response = finalResp,
-                                        modelName = "${provider.displayName} • $modelName"
-                                    )
+                                if (didRunInference) {
+                                    val cleaned = ThoughtParser.cleanStopTokens(responseBuilder.toString())
+                                    val parsedFinal = ThoughtParser.parse(cleaned, isStreaming = false)
+                                    val finalResp = parsedFinal.answerText.ifBlank { parsedFinal.thinkingText ?: cleaned }
+                                    val wasCancelled = cancelRequested.get()
+
+                                    withContext(Dispatchers.Main) {
+                                        isGenerating = false
+                                        if (finalResp.isNotBlank()) {
+                                            responseText = finalResp
+                                        }
+                                        statusText = if (wasCancelled) "Остановлено" else "Готово"
+                                        if (finalResp.isNotBlank()) {
+                                            LLMWidgetProvider.updateAllWidgets(
+                                                context = context,
+                                                query = queryText,
+                                                response = finalResp,
+                                                modelName = "${provider.displayName} • $modelName"
+                                            )
+                                        }
+                                    }
                                 }
                             } catch (e: Exception) {
-                                withContext(Dispatchers.Main) {
-                                    isGenerating = false
-                                    statusText = "Ошибка: ${e.message}"
-                                    responseText = "⚠️ Ошибка: ${e.message}"
+                                if (!cancelRequested.get()) {
+                                    withContext(Dispatchers.Main) {
+                                        isGenerating = false
+                                        statusText = "Ошибка: ${e.message}"
+                                        responseText = "⚠️ Ошибка: ${e.message}"
+                                    }
                                 }
                             }
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    enabled = !isGenerating
+                    enabled = isGenerating || inputText.isNotBlank() || attachedName != null,
+                    colors = if (isGenerating) {
+                        ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    } else {
+                        ButtonDefaults.buttonColors()
+                    }
                 ) {
                     if (isGenerating) {
-                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onError
+                        )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("Остановить")
                     } else {
-                        Icon(Icons.Default.Send, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("Отправить")
                     }
@@ -467,7 +569,6 @@ fun QuickPromptDialogContent(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Кнопка копирования
                         OutlinedButton(
                             onClick = {
                                 FileStorageManager.copyToClipboard(context, responseText)
@@ -485,7 +586,6 @@ fun QuickPromptDialogContent(
                             Text("Скопировать", fontSize = 11.sp)
                         }
 
-                        // Кнопка скачивания кода (если есть код)
                         if (codeBlocks.isNotEmpty()) {
                             Button(
                                 onClick = {
@@ -513,7 +613,6 @@ fun QuickPromptDialogContent(
 
                         Spacer(modifier = Modifier.weight(1f))
 
-                        // Открыть в основном чате
                         TextButton(
                             onClick = { onOpenFullApp(inputText) },
                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)

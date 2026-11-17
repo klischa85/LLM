@@ -166,8 +166,7 @@ object DeviceTools {
 
         val targetDirs = listOf(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
-            File(Environment.getExternalStorageDirectory(), "DCIM/Camera")
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         )
 
         for (dir in targetDirs) {

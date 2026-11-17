@@ -18,14 +18,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -144,6 +143,8 @@ fun ChatScreen(
                     uiState.chatSessions.filter { it.title.contains(chatSearchQuery, ignoreCase = true) }
                 }
 
+                val sessionDateFormat = remember { SimpleDateFormat("d MMM, HH:mm", Locale.getDefault()) }
+
                 LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -153,8 +154,7 @@ fun ChatScreen(
                 ) {
                     items(filteredSessions, key = { it.id }) { session ->
                         val isSelected = session.id == uiState.currentChatId
-                        val dateFormat = SimpleDateFormat("d MMM, HH:mm", Locale.getDefault())
-                        val timeStr = dateFormat.format(Date(session.updatedAt))
+                        val timeStr = sessionDateFormat.format(Date(session.updatedAt))
 
                         NavigationDrawerItem(
                             label = {
@@ -319,7 +319,7 @@ fun ChatScreen(
                 }
 
                 // 2. Информационная плашка статуса модели и производительности
-                DeviceStatusStrip(uiState, viewModel)
+                DeviceStatusStrip(uiState)
 
                 // 3. Область сообщений чата
                 Box(
@@ -378,7 +378,7 @@ fun ChatScreen(
 }
 
 @Composable
-fun DeviceStatusStrip(uiState: UiState, viewModel: LLMViewModel) {
+fun DeviceStatusStrip(uiState: UiState) {
     val isLocal = uiState.providerType == LLMProviderType.LOCAL_GGUF
     Card(
         modifier = Modifier
@@ -492,10 +492,12 @@ fun SystemPromptCard(uiState: UiState, viewModel: LLMViewModel) {
 
             Spacer(modifier = Modifier.height(4.dp))
 
-            // Пресеты
+            // Пресеты (горизонтальная прокрутка для узких экранов)
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 SystemPromptPreset.values().forEach { preset ->
                     FilterChip(
@@ -591,13 +593,26 @@ fun EmptyChatPlaceholder(
 
                 Spacer(modifier = Modifier.height(14.dp))
                 if (isLocal && !uiState.isModelLoaded) {
-                    Button(
-                        onClick = onSelectModelClick,
-                        shape = RoundedCornerShape(10.dp)
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Выбрать файл .gguf")
+                        Button(
+                            onClick = onSelectModelClick,
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Выбрать файл .gguf")
+                        }
+                        OutlinedButton(
+                            onClick = onOpenProviderSettings,
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Подключить DeepSeek / Облако")
+                        }
                     }
                 } else if (!isLocal && uiState.currentApiKey.isBlank()) {
                     Button(
@@ -657,6 +672,11 @@ fun ProviderSettingsDialog(
                         label = { Text("📱 Офлайн", fontSize = 11.sp) }
                     )
                     FilterChip(
+                        selected = uiState.providerType == LLMProviderType.DEEPSEEK,
+                        onClick = { viewModel.setProviderType(LLMProviderType.DEEPSEEK) },
+                        label = { Text("🐳 DeepSeek", fontSize = 11.sp) }
+                    )
+                    FilterChip(
                         selected = uiState.providerType == LLMProviderType.OPENROUTER,
                         onClick = { viewModel.setProviderType(LLMProviderType.OPENROUTER) },
                         label = { Text("🌐 OpenRouter Free", fontSize = 11.sp) }
@@ -688,6 +708,8 @@ fun ProviderSettingsDialog(
                     ) {
                         Text(
                             text = when (uiState.providerType) {
+                                LLMProviderType.DEEPSEEK ->
+                                    "🐳 DeepSeek API: официальный API DeepSeek (deepseek-chat — DeepSeek V3, deepseek-reasoner — DeepSeek R1 с рассуждениями). Получите ключ на platform.deepseek.com/api_keys."
                                 LLMProviderType.OPENROUTER ->
                                     "🌐 OpenRouter: десятки бесплатных моделей с суффиксом :free (Gemini 2.0 Flash, LLaMA 3.3 70B, Qwen 2.5 Coder, DeepSeek R1). Получите бесплатный ключ на openrouter.ai/keys."
                                 LLMProviderType.GROQ ->
@@ -716,6 +738,7 @@ fun ProviderSettingsDialog(
                         placeholder = {
                             Text(
                                 when (uiState.providerType) {
+                                    LLMProviderType.DEEPSEEK -> "sk-..."
                                     LLMProviderType.OPENROUTER -> "sk-or-v1-..."
                                     LLMProviderType.GROQ -> "gsk_..."
                                     LLMProviderType.OPENCODE_ZEN -> "sk-..."
@@ -788,13 +811,19 @@ fun ProviderSettingsDialog(
                                     ),
                                     modifier = Modifier.weight(1f)
                                 )
-                                if (isFree) {
+                                val badgeText = when {
+                                    isFree -> "Free"
+                                    uiState.providerType == LLMProviderType.DEEPSEEK && modelName == "deepseek-chat" -> "V3"
+                                    uiState.providerType == LLMProviderType.DEEPSEEK && modelName == "deepseek-reasoner" -> "R1"
+                                    else -> null
+                                }
+                                if (badgeText != null) {
                                     Surface(
                                         color = MaterialTheme.colorScheme.tertiaryContainer,
                                         shape = RoundedCornerShape(4.dp)
                                     ) {
                                         Text(
-                                            text = "Free",
+                                            text = badgeText,
                                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                             color = MaterialTheme.colorScheme.onTertiaryContainer,
                                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
@@ -821,6 +850,7 @@ fun ProviderSettingsDialog(
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = when (uiState.providerType) {
+                            LLMProviderType.DEEPSEEK -> "💡 deepseek-chat — быстрая DeepSeek V3; deepseek-reasoner — DeepSeek R1 с автоматическим сворачиванием блока рассуждений 💭."
                             LLMProviderType.OPENROUTER -> "💡 Модели с плашкой Free (суффикс :free) полностью бесплатны на OpenRouter без пополнения счета."
                             LLMProviderType.GROQ -> "💡 В Groq Cloud все модели предоставляются с высоким бесплатным лимитом (до 30 запросов в минуту)."
                             LLMProviderType.OPENCODE_ZEN -> "💡 Для платного аккаунта Zen рекомендуются: qwen3.6-plus, qwen3.8-flash, claude-3-7-sonnet, gpt-4o. Промо-модели Free предназначены для анонимного CLI."
@@ -853,8 +883,8 @@ fun ChatMessageBubble(
     onCopyClick: () -> Unit
 ) {
     val isUser = message.role == MessageRole.USER
-    val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
-    val timeStr = timeFormat.format(Date(message.timestamp))
+    val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+    val timeStr = remember(message.timestamp) { timeFormat.format(Date(message.timestamp)) }
     val context = LocalContext.current
 
     val parsed = remember(message.text, message.isStreaming) {
@@ -1067,7 +1097,7 @@ fun ChatMessageBubble(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (!isUser && message.text.isNotBlank()) {
                             Icon(
-                                imageVector = Icons.Default.Share,
+                                painter = painterResource(id = R.drawable.ic_copy),
                                 contentDescription = "Копировать",
                                 modifier = Modifier
                                     .size(14.dp)
@@ -1190,7 +1220,10 @@ fun ChatInputBar(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
                             Icon(
                                 painter = painterResource(id = R.drawable.ic_attach),
                                 contentDescription = null,
@@ -1201,7 +1234,8 @@ fun ChatInputBar(
                             Text(
                                 text = "${attached.name} (${attached.sizeBytes / 1024} КБ)",
                                 style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                                maxLines = 1
+                                maxLines = 1,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                             )
                         }
                         IconButton(onClick = onRemoveAttachmentClick, modifier = Modifier.size(24.dp)) {
@@ -1278,7 +1312,7 @@ fun ChatInputBar(
                             )
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Send,
+                            imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = "Отправить",
                             tint = if (isReady && (uiState.inputText.isNotBlank() || uiState.attachedDoc != null))
                                 MaterialTheme.colorScheme.onPrimary

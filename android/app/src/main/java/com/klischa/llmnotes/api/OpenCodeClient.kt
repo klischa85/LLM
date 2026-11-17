@@ -6,19 +6,20 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.URL
-import java.util.UUID
 import javax.net.ssl.HttpsURLConnection
 
 /**
  * Типы провайдеров LLM:
- * - LOCAL_GGUF: локальный автономный запуск на процессоре Helio G99 через llama.cpp (100% бесплатно, без интернета).
+ * - LOCAL_GGUF: локальный автономный запуск на процессоре смартфона через llama.cpp (100% офлайн).
+ * - DEEPSEEK: официальный API DeepSeek (https://api.deepseek.com/v1 — DeepSeek V3 `deepseek-chat`, DeepSeek R1 `deepseek-reasoner`).
  * - OPENROUTER: облачный API OpenRouter с десятками бесплатных моделей (:free).
- * - GROQ: облачный высокоскоростной API Groq с бесплатным доступом к LLaMA 3.3 70B.
+ * - GROQ: облачный высокоскоростной API Groq с доступом к LLaMA 3.3 70B.
  * - OPENCODE_ZEN: облачный API OpenCode подписки ZEN (https://opencode.ai/zen/v1).
  * - OPENCODE_GO: облачный API OpenCode подписки GO (https://opencode.ai/zen/go/v1).
  */
 enum class LLMProviderType(val displayName: String, val baseUrl: String) {
     LOCAL_GGUF("Офлайн GGUF", ""),
+    DEEPSEEK("DeepSeek API", "https://api.deepseek.com/v1"),
     OPENROUTER("OpenRouter (Free)", "https://openrouter.ai/api/v1"),
     GROQ("Groq Cloud (Free)", "https://api.groq.com/openai/v1"),
     OPENCODE_ZEN("OpenCode ZEN", "https://opencode.ai/zen/v1"),
@@ -32,10 +33,11 @@ data class ApiChatMessage(
 
 /**
  * Клиент взаимодействия с внешними OpenAI-совместимыми API:
- * OpenRouter, Groq Cloud, OpenCode ZEN, OpenCode GO.
+ * DeepSeek API, OpenRouter, Groq Cloud, OpenCode ZEN, OpenCode GO.
  */
 object OpenCodeClient {
     private const val TAG = "OpenCodeClient"
+    private const val APP_USER_AGENT = "LLM-Android/1.3.6"
     const val OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
 
     init {
@@ -43,6 +45,7 @@ object OpenCodeClient {
             System.setProperty("http.agent", OPENCODE_USER_AGENT)
         } catch (_: Exception) {}
     }
+
     private const val BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     private val secureRandom = java.security.SecureRandom()
     private var lastTimestamp = 0L
@@ -84,6 +87,12 @@ object OpenCodeClient {
 
     fun generateSessionId(): String = generateOpenCodeId("ses_", desc = true)
     fun generateRequestId(): String = generateOpenCodeId("msg_", desc = false)
+
+    // Официальные модели DeepSeek API (api.deepseek.com/v1)
+    val DEEPSEEK_DEFAULT_MODELS = listOf(
+        "deepseek-chat",
+        "deepseek-reasoner"
+    )
 
     // Рекомендуемые бесплатные модели OpenRouter (суффикс :free гарантирует бесплатность)
     val OPENROUTER_DEFAULT_MODELS = listOf(
@@ -151,11 +160,12 @@ object OpenCodeClient {
 
     fun getDefaultModels(provider: LLMProviderType): List<String> {
         return when (provider) {
+            LLMProviderType.DEEPSEEK -> DEEPSEEK_DEFAULT_MODELS
             LLMProviderType.OPENROUTER -> OPENROUTER_DEFAULT_MODELS
             LLMProviderType.GROQ -> GROQ_DEFAULT_MODELS
             LLMProviderType.OPENCODE_GO -> GO_DEFAULT_MODELS
             LLMProviderType.OPENCODE_ZEN -> ZEN_DEFAULT_MODELS
-            else -> emptyList()
+            LLMProviderType.LOCAL_GGUF -> emptyList()
         }
     }
 
@@ -179,13 +189,16 @@ object OpenCodeClient {
             conn.setRequestProperty("Accept", "application/json")
 
             when (provider) {
+                LLMProviderType.DEEPSEEK -> {
+                    conn.setRequestProperty("User-Agent", APP_USER_AGENT)
+                }
                 LLMProviderType.OPENROUTER -> {
-                    conn.setRequestProperty("User-Agent", "LLM-Android/1.2.6 (Infinix Note 30)")
+                    conn.setRequestProperty("User-Agent", APP_USER_AGENT)
                     conn.setRequestProperty("HTTP-Referer", "https://github.com/Klischa/LLM")
                     conn.setRequestProperty("X-Title", "LLM Android Assistant")
                 }
                 LLMProviderType.GROQ -> {
-                    conn.setRequestProperty("User-Agent", "LLM-Android/1.2.6 (Infinix Note 30)")
+                    conn.setRequestProperty("User-Agent", APP_USER_AGENT)
                 }
                 LLMProviderType.OPENCODE_GO, LLMProviderType.OPENCODE_ZEN -> {
                     val sessionId = generateSessionId()
@@ -197,7 +210,7 @@ object OpenCodeClient {
                     conn.setRequestProperty("x-opencode-session", sessionId)
                     conn.setRequestProperty("x-opencode-request", requestId)
                 }
-                else -> {}
+                LLMProviderType.LOCAL_GGUF -> Unit
             }
             conn.connectTimeout = 10000
             conn.readTimeout = 15000
@@ -231,6 +244,10 @@ object OpenCodeClient {
                 }
             }
 
+            if (provider == LLMProviderType.DEEPSEEK && list.isNotEmpty()) {
+                return (DEEPSEEK_DEFAULT_MODELS + list).distinct()
+            }
+
             if (provider == LLMProviderType.OPENROUTER && list.isNotEmpty()) {
                 val freeModels = list.filter { it.contains(":free") }.sorted()
                 val otherModels = list.filter { !it.contains(":free") }.sorted()
@@ -248,7 +265,10 @@ object OpenCodeClient {
 
     /**
      * Потоковая генерация ответа через Server-Sent Events (SSE).
+     * Рассуждения (`reasoning_content` / `reasoning`) автоматически оборачиваются в `<think>...</think>`,
+     * чтобы UI отображал их в аккуратной сворачиваемой карточке (ThoughtParser).
      */
+    @Suppress("UNUSED_PARAMETER")
     fun streamChatCompletions(
         provider: LLMProviderType,
         apiKey: String,
@@ -262,6 +282,10 @@ object OpenCodeClient {
         val endpoint = "${provider.baseUrl}/chat/completions"
         var conn: HttpsURLConnection? = null
         try {
+            val isDeepSeekReasoner =
+                provider == LLMProviderType.DEEPSEEK &&
+                    model.contains("reasoner", ignoreCase = true)
+
             val url = URL(endpoint)
             conn = url.openConnection() as HttpsURLConnection
             conn.requestMethod = "POST"
@@ -273,6 +297,9 @@ object OpenCodeClient {
             conn.setRequestProperty("Accept", "text/event-stream")
 
             when (provider) {
+                LLMProviderType.DEEPSEEK -> {
+                    conn.setRequestProperty("User-Agent", APP_USER_AGENT)
+                }
                 LLMProviderType.OPENCODE_GO, LLMProviderType.OPENCODE_ZEN -> {
                     val sessionId = generateSessionId()
                     val requestId = generateRequestId()
@@ -286,24 +313,28 @@ object OpenCodeClient {
                     conn.setRequestProperty("x-session-affinity", sessionId)
                 }
                 LLMProviderType.OPENROUTER -> {
-                    conn.setRequestProperty("User-Agent", "LLM-Android/1.2.6 (Infinix Note 30)")
+                    conn.setRequestProperty("User-Agent", APP_USER_AGENT)
                     conn.setRequestProperty("HTTP-Referer", "https://github.com/Klischa/LLM")
                     conn.setRequestProperty("X-Title", "LLM Android Assistant")
                 }
                 LLMProviderType.GROQ -> {
-                    conn.setRequestProperty("User-Agent", "LLM-Android/1.2.6 (Infinix Note 30)")
+                    conn.setRequestProperty("User-Agent", APP_USER_AGENT)
                 }
-                else -> {}
+                LLMProviderType.LOCAL_GGUF -> Unit
             }
 
             conn.doOutput = true
-            conn.connectTimeout = 15000
-            conn.readTimeout = 60000
+            conn.connectTimeout = 20000
+            // DeepSeek Reasoner (R1) может думать дольше перед выдачей первых токенов
+            conn.readTimeout = if (isDeepSeekReasoner) 120000 else 60000
 
             val rootJson = JSONObject().apply {
                 put("model", model)
                 put("stream", true)
-                put("temperature", temperature)
+                // Официальная спецификация DeepSeek: deepseek-reasoner не поддерживает параметр temperature
+                if (!isDeepSeekReasoner) {
+                    put("temperature", temperature.toDouble())
+                }
                 val msgsArr = JSONArray()
                 for (m in messages) {
                     msgsArr.put(JSONObject().apply {
@@ -332,10 +363,23 @@ object OpenCodeClient {
                 }
 
                 val tip = when (responseCode) {
-                    401 -> "Неверный API-ключ для ${provider.displayName}."
+                    401 -> when (provider) {
+                        LLMProviderType.DEEPSEEK ->
+                            "Неверный API-ключ DeepSeek. Проверьте ключ на platform.deepseek.com/api_keys."
+                        else -> "Неверный API-ключ для ${provider.displayName}."
+                    }
+                    402 -> if (provider == LLMProviderType.DEEPSEEK) {
+                        "Недостаточно средств на балансе DeepSeek API (HTTP 402). Пополните счёт на platform.deepseek.com."
+                    } else {
+                        "Требуется пополнение баланса ${provider.displayName}: $cleanErr"
+                    }
                     403 -> when (provider) {
-                        LLMProviderType.OPENROUTER -> "Доступ отклонен OpenRouter ($cleanErr). Проверьте ключ на openrouter.ai/keys."
-                        LLMProviderType.GROQ -> "Доступ отклонен Groq Cloud ($cleanErr). Проверьте ключ на console.groq.com."
+                        LLMProviderType.DEEPSEEK ->
+                            "Доступ отклонён DeepSeek API ($cleanErr). Проверьте статус аккаунта на platform.deepseek.com."
+                        LLMProviderType.OPENROUTER ->
+                            "Доступ отклонен OpenRouter ($cleanErr). Проверьте ключ на openrouter.ai/keys."
+                        LLMProviderType.GROQ ->
+                            "Доступ отклонен Groq Cloud ($cleanErr). Проверьте ключ на console.groq.com."
                         else -> if (isFreeModel(provider, model)) {
                             "Бесплатная промо-модель '$model' заблокирована шлюзом OpenCode для вашего платного API-ключа (HTTP 403).\n💡 Выберите стандартную модель из каталога (например, 'qwen3.6-plus', 'claude-3-7-sonnet', 'gpt-4o')."
                         } else {
@@ -348,50 +392,66 @@ object OpenCodeClient {
                         "Модель '$model' не найдена или временно недоступна: $cleanErr"
                     }
                     429 -> "Превышен лимит запросов ${provider.displayName}. Попробуйте чуть позже."
+                    500, 502, 503, 504 -> "Сервер ${provider.displayName} временно перегружен (HTTP $responseCode). Повторите попытку."
                     else -> cleanErr
                 }
                 throw Exception("Ошибка ${provider.displayName} ($responseCode): $tip")
             }
 
-            val reader = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8))
-            var line: String?
-            var isThinking = false
-            while (reader.readLine().also { line = it } != null) {
-                if (isCancelled()) break
-                val l = line?.trim() ?: continue
-                if (l.startsWith("data: ")) {
-                    val payload = l.removePrefix("data: ").trim()
-                    if (payload == "[DONE]") break
-                    try {
-                        val chunkJson = JSONObject(payload)
-                        val choices = chunkJson.optJSONArray("choices")
-                        if (choices != null && choices.length() > 0) {
-                            val delta = choices.getJSONObject(0).optJSONObject("delta")
-                            val content = if (delta != null && !delta.isNull("content")) {
-                                val s = delta.optString("content", "")
-                                if (s == "null") "" else s
-                            } else ""
+            BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { reader ->
+                var line: String?
+                var isThinking = false
+                while (reader.readLine().also { line = it } != null) {
+                    if (isCancelled()) break
+                    val l = line?.trim() ?: continue
+                    if (l.isEmpty() || l.startsWith(":")) continue
 
-                            val reasoning = if (delta != null && !delta.isNull("reasoning_content")) {
-                                val s = delta.optString("reasoning_content", "")
-                                if (s == "null") "" else s
-                            } else ""
+                    if (l.startsWith("data:")) {
+                        val payload = l.removePrefix("data:").trim()
+                        if (payload == "[DONE]") break
+                        try {
+                            val chunkJson = JSONObject(payload)
+                            val choices = chunkJson.optJSONArray("choices")
+                            if (choices != null && choices.length() > 0) {
+                                val delta = choices.getJSONObject(0).optJSONObject("delta")
+                                val content = if (delta != null && !delta.isNull("content")) {
+                                    val s = delta.optString("content", "")
+                                    if (s == "null") "" else s
+                                } else ""
 
-                            if (reasoning.isNotEmpty()) {
-                                if (!isThinking) {
-                                    isThinking = true
-                                    onToken("💭 *Размышления:*\n")
+                                val reasoning = when {
+                                    delta != null && !delta.isNull("reasoning_content") -> {
+                                        val s = delta.optString("reasoning_content", "")
+                                        if (s == "null") "" else s
+                                    }
+                                    delta != null && !delta.isNull("reasoning") -> {
+                                        val s = delta.optString("reasoning", "")
+                                        if (s == "null") "" else s
+                                    }
+                                    else -> ""
                                 }
-                                onToken(reasoning)
-                            } else if (content.isNotEmpty()) {
-                                if (isThinking) {
-                                    isThinking = false
-                                    onToken("\n\n---\n\n")
+
+                                if (reasoning.isNotEmpty()) {
+                                    if (!isThinking) {
+                                        isThinking = true
+                                        onToken("<think>\n")
+                                    }
+                                    onToken(reasoning)
                                 }
-                                onToken(content)
+                                if (content.isNotEmpty()) {
+                                    if (isThinking) {
+                                        isThinking = false
+                                        onToken("\n</think>\n")
+                                    }
+                                    onToken(content)
+                                }
                             }
-                        }
-                    } catch (_: Exception) {}
+                        } catch (_: Exception) {}
+                    }
+                }
+                // Если поток завершился внутри блока рассуждений, аккуратно закрываем тег <think>
+                if (isThinking) {
+                    onToken("\n</think>\n")
                 }
             }
         } finally {

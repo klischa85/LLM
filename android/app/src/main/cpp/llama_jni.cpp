@@ -2,9 +2,11 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <mutex>
 #include <algorithm>
 #include <cstring>
 #include <cerrno>
+#include <cstdint>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -18,9 +20,11 @@
 static llama_model   * g_model   = nullptr;
 static llama_context * g_context = nullptr;
 static std::atomic<bool> g_stop_requested(false);
+static std::mutex g_llama_mutex;
 static std::string g_last_error = "";
 
 static void llama_log_callback_capture(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) user_data;
     if (text) {
         if (level == GGML_LOG_LEVEL_ERROR) {
             LOGE("%s", text);
@@ -33,10 +37,159 @@ static void llama_log_callback_capture(enum ggml_log_level level, const char * t
     }
 }
 
+/**
+ * Безопасное преобразование стандартной UTF-8 строки (включая 4-байтные эмодзи)
+ * в JNI jstring через UTF-16 (env->NewString), избегая крашей ART в NewStringUTF.
+ */
+static jstring utf8_to_jstring(JNIEnv *env, const std::string &utf8) {
+    std::vector<jchar> utf16;
+    utf16.reserve(utf8.size());
+
+    size_t i = 0;
+    const size_t n = utf8.size();
+    while (i < n) {
+        uint8_t c = static_cast<uint8_t>(utf8[i]);
+        uint32_t cp = 0;
+        size_t extra = 0;
+
+        if (c < 0x80) {
+            cp = c;
+            extra = 0;
+        } else if ((c & 0xE0) == 0xC0) {
+            cp = c & 0x1F;
+            extra = 1;
+        } else if ((c & 0xF0) == 0xE0) {
+            cp = c & 0x0F;
+            extra = 2;
+        } else if ((c & 0xF8) == 0xF0) {
+            cp = c & 0x07;
+            extra = 3;
+        } else {
+            // Невалидный байт — заменяем на U+FFFD
+            utf16.push_back(0xFFFD);
+            i++;
+            continue;
+        }
+
+        if (i + extra >= n) {
+            utf16.push_back(0xFFFD);
+            break;
+        }
+
+        bool valid = true;
+        for (size_t k = 1; k <= extra; ++k) {
+            uint8_t cc = static_cast<uint8_t>(utf8[i + k]);
+            if ((cc & 0xC0) != 0x80) {
+                valid = false;
+                break;
+            }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+
+        if (!valid) {
+            utf16.push_back(0xFFFD);
+            i++;
+            continue;
+        }
+
+        i += extra + 1;
+
+        if (cp <= 0xFFFF) {
+            utf16.push_back(static_cast<jchar>(cp));
+        } else if (cp <= 0x10FFFF) {
+            cp -= 0x10000;
+            utf16.push_back(static_cast<jchar>(0xD800 + (cp >> 10)));
+            utf16.push_back(static_cast<jchar>(0xDC00 + (cp & 0x3FF)));
+        } else {
+            utf16.push_back(0xFFFD);
+        }
+    }
+
+    return env->NewString(utf16.empty() ? nullptr : utf16.data(), static_cast<jsize>(utf16.size()));
+}
+
+/**
+ * Безопасное преобразование JNI jstring (UTF-16) в стандартную UTF-8 строку (включая 4-байтные эмодзи).
+ */
+static std::string jstring_to_utf8(JNIEnv *env, jstring jstr) {
+    if (!jstr) return "";
+    const jchar *chars = env->GetStringChars(jstr, nullptr);
+    if (!chars) return "";
+    jsize len = env->GetStringLength(jstr);
+
+    std::string out;
+    out.reserve(static_cast<size_t>(len) * 2);
+
+    for (jsize i = 0; i < len; ++i) {
+        uint32_t cp = chars[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && (i + 1) < len) {
+            uint32_t low = chars[i + 1];
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                i++;
+            }
+        }
+        if (cp < 0x80) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) {
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+
+    env->ReleaseStringChars(jstr, chars);
+    return out;
+}
+
+/**
+ * Вычисляет длину завершённого валидного UTF-8 префикса строки, оставляя неполную
+ * многобайтовую последовательность в хвосте для следующего токена.
+ */
+static size_t valid_utf8_prefix_len(const std::string &s) {
+    size_t i = 0;
+    const size_t n = s.size();
+    while (i < n) {
+        uint8_t c = static_cast<uint8_t>(s[i]);
+        size_t need = 1;
+        if (c < 0x80) {
+            need = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            need = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            need = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            need = 4;
+        } else {
+            // Одиночный невалидный continuation-байт — пропускаем
+            i++;
+            continue;
+        }
+        if (i + need > n) {
+            break; // Незавершённая последовательность в конце — ждём следующий токен
+        }
+        i += need;
+    }
+    return i;
+}
+
+static bool ends_with(const std::string &str, const std::string &suffix) {
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 static void batch_add_token(struct llama_batch & batch, llama_token id, llama_pos pos, const std::vector<llama_seq_id> & seq_ids, bool logits) {
     batch.token   [batch.n_tokens] = id;
     batch.pos     [batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
+    batch.n_seq_id[batch.n_tokens] = static_cast<int32_t>(seq_ids.size());
     for (size_t i = 0; i < seq_ids.size(); ++i) {
         batch.seq_id[batch.n_tokens][i] = seq_ids[i];
     }
@@ -48,6 +201,8 @@ extern "C" {
 
 JNIEXPORT jboolean JNICALL
 Java_com_klischa_llmnotes_LlamaBridge_nativeInit(JNIEnv *env, jobject thiz) {
+    (void) env;
+    (void) thiz;
     LOGI("Инициализация llama_backend_init()");
     llama_backend_init();
     llama_log_set(llama_log_callback_capture, nullptr);
@@ -62,12 +217,17 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeLoadModel(
     jint n_ctx,
     jint n_threads
 ) {
+    (void) thiz;
+    g_stop_requested.store(true);
+    std::lock_guard<std::mutex> lock(g_llama_mutex);
+    g_stop_requested.store(false);
     g_last_error.clear();
 
-    const char *path = env->GetStringUTFChars(model_path, nullptr);
-    if (!path) {
-        return env->NewStringUTF("Не удалось прочитать путь к файлу модели");
+    std::string path_str = jstring_to_utf8(env, model_path);
+    if (path_str.empty()) {
+        return utf8_to_jstring(env, "Не удалось прочитать путь к файлу модели");
     }
+    const char *path = path_str.c_str();
 
     LOGI("Загрузка модели из: %s (контекст: %d, потоков: %d)", path, n_ctx, n_threads);
 
@@ -86,8 +246,7 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeLoadModel(
         if (!f) {
             std::string err = "Не удалось открыть файл: " + std::string(strerror(errno));
             LOGE("%s (%s)", err.c_str(), path);
-            env->ReleaseStringUTFChars(model_path, path);
-            return env->NewStringUTF(err.c_str());
+            return utf8_to_jstring(env, err);
         }
         fseek(f, 0, SEEK_END);
         st.st_size = ftell(f);
@@ -97,8 +256,7 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeLoadModel(
     if (st.st_size < 1024 * 1024) {
         std::string err = "Файл поврежден или недокачан (размер: " + std::to_string(st.st_size / 1024) + " КБ)";
         LOGE("%s", err.c_str());
-        env->ReleaseStringUTFChars(model_path, path);
-        return env->NewStringUTF(err.c_str());
+        return utf8_to_jstring(env, err);
     }
 
     // Освобождение ранее загруженных ресурсов
@@ -123,12 +281,11 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeLoadModel(
         model_params.use_mmap = false;
         g_model = llama_load_model_from_file(path, model_params);
     }
-    env->ReleaseStringUTFChars(model_path, path);
 
     if (!g_model) {
         std::string err = "Ошибка llama_load_model_from_file: " + (g_last_error.empty() ? "неверный формат GGUF или поврежденный файл" : g_last_error);
         LOGE("%s", err.c_str());
-        return env->NewStringUTF(err.c_str());
+        return utf8_to_jstring(env, err);
     }
 
     // 3. Создание контекста с адаптивным размером
@@ -154,22 +311,28 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeLoadModel(
         g_model = nullptr;
         std::string err = "Недостаточно памяти для создания контекста: " + g_last_error;
         LOGE("%s", err.c_str());
-        return env->NewStringUTF(err.c_str());
+        return utf8_to_jstring(env, err);
     }
 
     LOGI("Модель успешно загружена в память!");
-    return env->NewStringUTF("");
+    return utf8_to_jstring(env, "");
 }
 
 JNIEXPORT void JNICALL
 Java_com_klischa_llmnotes_LlamaBridge_nativeStop(JNIEnv *env, jobject thiz) {
+    (void) env;
+    (void) thiz;
     LOGI("Запрос на прерывание инференса");
     g_stop_requested.store(true);
 }
 
 JNIEXPORT void JNICALL
 Java_com_klischa_llmnotes_LlamaBridge_nativeUnload(JNIEnv *env, jobject thiz) {
+    (void) env;
+    (void) thiz;
     LOGI("Выгрузка модели и освобождение памяти");
+    g_stop_requested.store(true);
+    std::lock_guard<std::mutex> lock(g_llama_mutex);
     if (g_context) {
         llama_free(g_context);
         g_context = nullptr;
@@ -187,16 +350,12 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatPrompt(
     jstring system_prompt_str,
     jstring user_prompt_str
 ) {
-    if (!g_model) return user_prompt_str;
+    (void) thiz;
+    std::lock_guard<std::mutex> lock(g_llama_mutex);
+    if (!g_model) return user_prompt_str ? user_prompt_str : utf8_to_jstring(env, "");
 
-    const char *sys_ptr = system_prompt_str ? env->GetStringUTFChars(system_prompt_str, nullptr) : nullptr;
-    const char *usr_ptr = user_prompt_str ? env->GetStringUTFChars(user_prompt_str, nullptr) : nullptr;
-
-    std::string sys_str = sys_ptr ? sys_ptr : "";
-    std::string usr_str = usr_ptr ? usr_ptr : "";
-
-    if (sys_ptr) env->ReleaseStringUTFChars(system_prompt_str, sys_ptr);
-    if (usr_ptr) env->ReleaseStringUTFChars(user_prompt_str, usr_ptr);
+    std::string sys_str = jstring_to_utf8(env, system_prompt_str);
+    std::string usr_str = jstring_to_utf8(env, user_prompt_str);
 
     std::vector<llama_chat_message> chat;
     if (!sys_str.empty()) {
@@ -207,7 +366,7 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatPrompt(
     }
 
     if (chat.empty()) {
-        return env->NewStringUTF("");
+        return utf8_to_jstring(env, "");
     }
 
     int32_t req_len = llama_chat_apply_template(g_model, nullptr, chat.data(), chat.size(), true, nullptr, 0);
@@ -233,7 +392,7 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatPrompt(
                 }
             }
 
-            return env->NewStringUTF(templated.c_str());
+            return utf8_to_jstring(env, templated);
         }
     }
 
@@ -243,7 +402,7 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatPrompt(
     }
     fallback += "<|im_start|>user\n" + usr_str + "<|im_end|>\n<|im_start|>assistant\n";
 
-    return env->NewStringUTF(fallback.c_str());
+    return utf8_to_jstring(env, fallback);
 }
 
 JNIEXPORT jstring JNICALL
@@ -253,13 +412,15 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatChat(
     jobjectArray roles_arr,
     jobjectArray contents_arr
 ) {
+    (void) thiz;
+    std::lock_guard<std::mutex> lock(g_llama_mutex);
     if (!roles_arr || !contents_arr) {
-        return env->NewStringUTF("");
+        return utf8_to_jstring(env, "");
     }
 
-    int n_msgs = env->GetArrayLength(roles_arr);
+    int n_msgs = std::min(env->GetArrayLength(roles_arr), env->GetArrayLength(contents_arr));
     if (n_msgs <= 0) {
-        return env->NewStringUTF("");
+        return utf8_to_jstring(env, "");
     }
 
     std::vector<std::string> roles(n_msgs);
@@ -271,18 +432,12 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatChat(
         jstring r_str = (jstring)env->GetObjectArrayElement(roles_arr, i);
         jstring c_str = (jstring)env->GetObjectArrayElement(contents_arr, i);
 
-        const char * r_chars = r_str ? env->GetStringUTFChars(r_str, nullptr) : "";
-        const char * c_chars = c_str ? env->GetStringUTFChars(c_str, nullptr) : "";
-
-        roles[i] = r_chars ? r_chars : "";
-        contents[i] = c_chars ? c_chars : "";
+        roles[i] = jstring_to_utf8(env, r_str);
+        contents[i] = jstring_to_utf8(env, c_str);
 
         if (roles[i] == "system" && sys_content.empty()) {
             sys_content = contents[i];
         }
-
-        if (r_str && r_chars) env->ReleaseStringUTFChars(r_str, r_chars);
-        if (c_str && c_chars) env->ReleaseStringUTFChars(c_str, c_chars);
 
         if (r_str) env->DeleteLocalRef(r_str);
         if (c_str) env->DeleteLocalRef(c_str);
@@ -315,7 +470,7 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatChat(
                     }
                 }
 
-                return env->NewStringUTF(templated.c_str());
+                return utf8_to_jstring(env, templated);
             }
         }
     }
@@ -327,7 +482,7 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatChat(
     }
     fallback += "<|im_start|>assistant\n";
 
-    return env->NewStringUTF(fallback.c_str());
+    return utf8_to_jstring(env, fallback);
 }
 
 JNIEXPORT jstring JNICALL
@@ -340,13 +495,15 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
     jfloat top_p,
     jobject callback_obj
 ) {
+    (void) thiz;
+    std::lock_guard<std::mutex> lock(g_llama_mutex);
     if (!g_model || !g_context) {
         LOGE("Модель не инициализирована!");
-        return env->NewStringUTF("Ошибка: модель не загружена.");
+        return utf8_to_jstring(env, "Ошибка: модель не загружена.");
     }
 
-    const char *prompt = env->GetStringUTFChars(prompt_str, nullptr);
-    if (!prompt) return env->NewStringUTF("");
+    std::string prompt = jstring_to_utf8(env, prompt_str);
+    if (prompt.empty()) return utf8_to_jstring(env, "");
 
     g_stop_requested.store(false);
 
@@ -357,48 +514,75 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
         on_token_method = env->GetMethodID(callback_class, "onToken", "(Ljava/lang/String;)V");
     }
 
-    // Токенизация входного промпта
-    // ВАЖНО: add_special = false, так как готовый промпт из llama_chat_apply_template / fallback
-    // уже содержит собственный BOS-токен (например, <｜begin of sentence｜> или токен 1).
-    // Повторное добавление BOS (add_special = true) ломает эмбеддинги позиций и приводит к бессвязной генерации.
-    int n_prompt_tokens = -llama_tokenize(g_model, prompt, strlen(prompt), nullptr, 0, false, true);
+    // Токенизация входного промпта (add_special = false, чтобы не дублировать BOS)
+    int n_prompt_tokens = -llama_tokenize(g_model, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, false, true);
+    if (n_prompt_tokens <= 0) {
+        if (callback_class) env->DeleteLocalRef(callback_class);
+        return utf8_to_jstring(env, "Ошибка токенизации");
+    }
+
     std::vector<llama_token> prompt_tokens(n_prompt_tokens);
-    if (llama_tokenize(g_model, prompt, strlen(prompt), prompt_tokens.data(), prompt_tokens.size(), false, true) < 0) {
-        env->ReleaseStringUTFChars(prompt_str, prompt);
-        return env->NewStringUTF("Ошибка токенизации");
+    if (llama_tokenize(g_model, prompt.c_str(), static_cast<int32_t>(prompt.size()), prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()), false, true) < 0) {
+        if (callback_class) env->DeleteLocalRef(callback_class);
+        return utf8_to_jstring(env, "Ошибка токенизации");
     }
 
-    env->ReleaseStringUTFChars(prompt_str, prompt);
+    // Защита от переполнения контекстного окна n_ctx
+    const int n_ctx = static_cast<int>(llama_n_ctx(g_context));
+    const int max_prompt_tokens = std::max(64, n_ctx - 32);
+    if (static_cast<int>(prompt_tokens.size()) > max_prompt_tokens) {
+        LOGI("Промпт (%zu токенов) превышает лимит контекста (%d). Обрезаем старую часть.", prompt_tokens.size(), max_prompt_tokens);
+        // Сохраняем BOS/начало (64 токена) и самый свежий хвост
+        std::vector<llama_token> trimmed;
+        trimmed.reserve(max_prompt_tokens);
+        int keep_head = std::min(64, max_prompt_tokens / 4);
+        int keep_tail = max_prompt_tokens - keep_head;
+        trimmed.insert(trimmed.end(), prompt_tokens.begin(), prompt_tokens.begin() + keep_head);
+        trimmed.insert(trimmed.end(), prompt_tokens.end() - keep_tail, prompt_tokens.end());
+        prompt_tokens.swap(trimmed);
+    }
 
-    // Подготовка KV-кэша и батча
+    // Подготовка KV-кэша и батчевое декодирование промпта по 512 токенов (исправляет SIGSEGV при длинном контексте!)
     llama_kv_cache_clear(g_context);
-    struct llama_batch batch = llama_batch_init(512, 0, 1);
+    const int n_batch = 512;
+    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
 
-    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-        bool need_logits = (i == prompt_tokens.size() - 1);
-        batch_add_token(batch, prompt_tokens[i], i, { 0 }, need_logits);
-    }
-
-    if (llama_decode(g_context, batch) != 0) {
-        LOGE("Ошибка: сбой llama_decode для промпта");
-        llama_batch_free(batch);
-        return env->NewStringUTF("Ошибка декодирования промпта");
+    for (size_t start = 0; start < prompt_tokens.size(); start += n_batch) {
+        if (g_stop_requested.load()) {
+            llama_batch_free(batch);
+            if (callback_class) env->DeleteLocalRef(callback_class);
+            return utf8_to_jstring(env, "");
+        }
+        batch.n_tokens = 0;
+        size_t end = std::min(prompt_tokens.size(), start + static_cast<size_t>(n_batch));
+        for (size_t i = start; i < end; ++i) {
+            bool need_logits = (i == prompt_tokens.size() - 1);
+            batch_add_token(batch, prompt_tokens[i], static_cast<llama_pos>(i), { 0 }, need_logits);
+        }
+        if (llama_decode(g_context, batch) != 0) {
+            LOGE("Ошибка: сбой llama_decode для чанка промпта [%zu..%zu)", start, end);
+            llama_batch_free(batch);
+            if (callback_class) env->DeleteLocalRef(callback_class);
+            return utf8_to_jstring(env, "Ошибка декодирования промпта");
+        }
     }
 
     std::string full_response = "";
-    int n_cur = batch.n_tokens;
+    std::string utf8_pending = "";
+    int n_cur = static_cast<int>(prompt_tokens.size());
     int generated_count = 0;
     int32_t n_vocab = llama_n_vocab(g_model);
 
-    // Буфер последних сгенерированных токенов для мягкого штрафа за повторы
-    // ВАЖНО: не заполняем буфер токенами из входного промпта! Иначе модель штрафуется
-    // за использование обычных слов русского языка и начинает подбирать китайские и английские синонимы.
     std::vector<llama_token> last_tokens;
     last_tokens.reserve(64);
 
-    // Цикл декодирования токенов
-    while (generated_count < max_tokens && !g_stop_requested.load()) {
+    // Цикл декодирования токенов (с защитой n_cur < n_ctx)
+    while (generated_count < max_tokens && n_cur < n_ctx && !g_stop_requested.load()) {
         float * logits = llama_get_logits_ith(g_context, batch.n_tokens - 1);
+        if (!logits) {
+            LOGE("Ошибка: logits == nullptr");
+            break;
+        }
 
         std::vector<llama_token_data> candidates;
         candidates.reserve(n_vocab);
@@ -407,16 +591,15 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
         }
         llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
 
-        // Мягкий штраф за повторы только для уже сгенерированного текста (предотвращает циклы без подавления русской лексики)
         if (!last_tokens.empty()) {
             llama_sample_repetition_penalties(
                 g_context,
                 &candidates_p,
                 last_tokens.data(),
                 last_tokens.size(),
-                1.08f, // gentle repeat penalty
-                0.0f,  // no frequency penalty
-                0.0f   // no presence penalty
+                1.08f,
+                0.0f,
+                0.0f
             );
         }
 
@@ -459,11 +642,13 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
         full_response += piece;
         size_t cut_pos = std::string::npos;
         size_t p1 = full_response.rfind("<|");
-        if (p1 != std::string::npos && p1 >= full_response.size() - piece.size() - 4) {
+        if (p1 != std::string::npos && full_response.size() >= piece.size() + 4 && p1 >= full_response.size() - piece.size() - 4) {
+            cut_pos = p1;
+        } else if (p1 != std::string::npos && full_response.size() < piece.size() + 4) {
             cut_pos = p1;
         }
         size_t p2 = full_response.rfind("<｜");
-        if (p2 != std::string::npos && p2 >= full_response.size() - piece.size() - 8) {
+        if (p2 != std::string::npos && (full_response.size() < piece.size() + 8 || p2 >= full_response.size() - piece.size() - 8)) {
             cut_pos = (cut_pos == std::string::npos) ? p2 : std::min(cut_pos, p2);
         }
 
@@ -473,11 +658,17 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
             break;
         }
 
-        // 4. Отправка подтвержденного чистого токена подписчику (Compose UI)
-        if (callback_obj != nullptr && on_token_method != nullptr) {
-            jstring piece_jstr = env->NewStringUTF(piece.c_str());
-            env->CallVoidMethod(callback_obj, on_token_method, piece_jstr);
-            env->DeleteLocalRef(piece_jstr);
+        // 4. Безопасная потоковая отправка полных UTF-8 символов подписчику (Compose UI)
+        utf8_pending += piece;
+        size_t emit_len = valid_utf8_prefix_len(utf8_pending);
+        if (emit_len > 0) {
+            std::string ready_chunk = utf8_pending.substr(0, emit_len);
+            utf8_pending.erase(0, emit_len);
+            if (callback_obj != nullptr && on_token_method != nullptr) {
+                jstring piece_jstr = utf8_to_jstring(env, ready_chunk);
+                env->CallVoidMethod(callback_obj, on_token_method, piece_jstr);
+                env->DeleteLocalRef(piece_jstr);
+            }
         }
 
         // 5. В буфер штрафов добавляем только смысловые токены
@@ -500,19 +691,27 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
         generated_count++;
     }
 
-    // Удаляем любые остаточные висячие символы разметки в конце ответа (<, |, ｜)
-    while (!full_response.empty() && 
-           (full_response.back() == '<' || full_response.back() == '|' || (unsigned char)full_response.back() > 127)) {
-        size_t last_lt = full_response.rfind('<');
-        if (last_lt != std::string::npos && last_lt >= full_response.size() - 6) {
-            full_response = full_response.substr(0, last_lt);
+    // Безопасно удаляем ТОЛЬКО реальные висячие символы служебных тегов в хвосте (<, |, ｜),
+    // НЕ затрагивая кириллицу и обычные UTF-8 символы!
+    const std::string fullwidth_bar = "\xEF\xBD\x9C"; // '｜'
+    while (!full_response.empty()) {
+        if (full_response.back() == '<') {
+            full_response.pop_back();
+        } else if (full_response.back() == '|' &&
+                   full_response.size() >= 2 && full_response[full_response.size() - 2] == '<') {
+            full_response.erase(full_response.size() - 2);
+        } else if (ends_with(full_response, fullwidth_bar) &&
+                   full_response.size() > fullwidth_bar.size() &&
+                   full_response[full_response.size() - fullwidth_bar.size() - 1] == '<') {
+            full_response.erase(full_response.size() - fullwidth_bar.size() - 1);
         } else {
             break;
         }
     }
 
     llama_batch_free(batch);
-    return env->NewStringUTF(full_response.c_str());
+    if (callback_class) env->DeleteLocalRef(callback_class);
+    return utf8_to_jstring(env, full_response);
 }
 
 } // extern "C"
