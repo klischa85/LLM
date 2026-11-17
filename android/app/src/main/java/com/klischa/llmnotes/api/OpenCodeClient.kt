@@ -271,7 +271,7 @@ data class StreamCompletionResult(
  */
 object OpenCodeClient {
     private const val TAG = "OpenCodeClient"
-    private const val APP_USER_AGENT = "LLM-Android/1.3.10"
+    private const val APP_USER_AGENT = "LLM-Android/1.4.0"
     const val OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
 
     init {

@@ -12,6 +12,8 @@ import androidx.lifecycle.viewModelScope
 import com.klischa.llmnotes.api.ApiChatMessage
 import com.klischa.llmnotes.api.LLMProviderType
 import com.klischa.llmnotes.api.OpenCodeClient
+import com.klischa.llmnotes.browser.AgentBrowserEngine
+import com.klischa.llmnotes.browser.BrowserSearchEngine
 import com.klischa.llmnotes.security.SecureKeyStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -121,10 +123,13 @@ data class UiState(
     val threadCount: Int = 2, // Оптимум 2 ядра Cortex-A76 для Helio G99
     val temperature: Float = 0.6f,
     val topP: Float = 0.9f,
-    // Режим агента (работа с файлами устройства и Termux RUN_COMMAND)
+    // Режим агента (работа с файлами устройства, встроенным браузером и Termux RUN_COMMAND)
     val agentModeEnabled: Boolean = true,
     val agentConfirmationMode: AgentConfirmationMode = AgentConfirmationMode.CONFIRM_DESTRUCTIVE,
     val isAgentDialogVisible: Boolean = false,
+    val isBrowserVisible: Boolean = false,
+    val browserSearchEngine: BrowserSearchEngine = BrowserSearchEngine.DUCKDUCKGO,
+    val browserIncognitoMode: Boolean = false,
     val termuxStatus: TermuxStatus = TermuxStatus(isInstalled = false, hasRunPermission = false),
     val termuxTestOutput: String = "",
     val isTestingTermux: Boolean = false,
@@ -187,6 +192,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREF_THINKING_ENABLED = "thinking_enabled"
         private const val PREF_AGENT_MODE_ENABLED = "agent_mode_enabled"
         private const val PREF_AGENT_CONFIRM_MODE = "agent_confirm_mode"
+        private const val PREF_BROWSER_SEARCH_ENGINE = "browser_search_engine"
+        private const val PREF_BROWSER_INCOGNITO = "browser_incognito"
     }
 
     fun saveLastModelInfo(directPath: String?, uriStr: String?, displayName: String) {
@@ -338,6 +345,12 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) {
             AgentConfirmationMode.CONFIRM_DESTRUCTIVE
         }
+        val savedEngineStr = prefs.getString(PREF_BROWSER_SEARCH_ENGINE, BrowserSearchEngine.DUCKDUCKGO.id)
+        val browserEngine = BrowserSearchEngine.fromString(savedEngineStr) ?: BrowserSearchEngine.DUCKDUCKGO
+        val browserIncognito = prefs.getBoolean(PREF_BROWSER_INCOGNITO, false)
+        AgentBrowserEngine.setSearchEngine(browserEngine)
+        AgentBrowserEngine.setIncognitoMode(browserIncognito)
+
         val termuxStatus = TermuxBridge.checkStatus(app)
 
         _uiState.update { current ->
@@ -351,9 +364,110 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 skills = loadedSkills,
                 agentModeEnabled = agentEnabled,
                 agentConfirmationMode = confirmMode,
+                browserSearchEngine = browserEngine,
+                browserIncognitoMode = browserIncognito,
                 termuxStatus = termuxStatus
             )
             updated.copy(statusMessage = buildIdleStatus(updated))
+        }
+    }
+
+    // ==================== Встроенный браузер агента ====================
+
+    fun setBrowserVisible(visible: Boolean) {
+        _uiState.update { it.copy(isBrowserVisible = visible) }
+    }
+
+    fun setBrowserSearchEngine(engine: BrowserSearchEngine) {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(PREF_BROWSER_SEARCH_ENGINE, engine.id).apply()
+        AgentBrowserEngine.setSearchEngine(engine)
+        _uiState.update {
+            it.copy(
+                browserSearchEngine = engine,
+                statusMessage = "🌐 Поисковик браузера: ${engine.displayName}"
+            )
+        }
+    }
+
+    fun setBrowserIncognitoMode(enabled: Boolean) {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(PREF_BROWSER_INCOGNITO, enabled).apply()
+        AgentBrowserEngine.setIncognitoMode(enabled)
+        _uiState.update {
+            it.copy(
+                browserIncognitoMode = enabled,
+                statusMessage = if (enabled) "🕵️ Браузер: режим Инкогнито включён" else "🌐 Браузер: сохранение сессий включено"
+            )
+        }
+    }
+
+    fun setBrowserDesktopMode(enabled: Boolean) {
+        AgentBrowserEngine.setDesktopMode(enabled)
+    }
+
+    fun clearBrowserData() {
+        AgentBrowserEngine.clearBrowsingData()
+        _uiState.update { it.copy(statusMessage = "🧹 Куки, кэш и история браузера очищены") }
+    }
+
+    fun attachBrowserScreenshotToChat() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val captured = AgentBrowserEngine.captureScreenshotForChat(getApplication())
+            if (captured == null) {
+                _uiState.update { it.copy(statusMessage = "⚠️ Не удалось снять скриншот страницы") }
+                return@launch
+            }
+            val (b64, w, h) = captured
+            val host = AgentBrowserEngine.state.value.shortHost.ifBlank { "browser" }
+            val pageUrl = AgentBrowserEngine.state.value.currentUrl
+            val doc = AttachedDoc(
+                name = "screenshot_$host.jpg",
+                sizeBytes = (b64.length * 3L) / 4L,
+                content = "Скриншот страницы из встроенного браузера ($pageUrl, ${w}x${h}).",
+                path = null,
+                mimeType = "image/jpeg",
+                category = AttachmentCategory.IMAGE,
+                imageBase64 = b64,
+                imageWidth = w,
+                imageHeight = h,
+                summaryBadge = "🌐 ${w}x${h}"
+            )
+            _uiState.update {
+                it.copy(
+                    attachedDoc = doc,
+                    isBrowserVisible = false,
+                    statusMessage = "📸 Скриншот $host (${w}x${h}) прикреплён к сообщению"
+                )
+            }
+        }
+    }
+
+    fun attachBrowserTextToChat() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val extracted = AgentBrowserEngine.extractTextForChat(getApplication())
+            if (extracted == null) {
+                _uiState.update { it.copy(statusMessage = "⚠️ Нет открытой страницы для извлечения текста") }
+                return@launch
+            }
+            val (title, text) = extracted
+            val safeName = title.replace(Regex("[^\\p{L}\\p{N}_-]+"), "_").take(32).ifBlank { "page" }
+            val doc = AttachedDoc(
+                name = "$safeName.txt",
+                sizeBytes = text.toByteArray(Charsets.UTF_8).size.toLong(),
+                content = text,
+                path = null,
+                mimeType = "text/plain",
+                category = AttachmentCategory.TEXT,
+                summaryBadge = "🌐 Веб-страница"
+            )
+            _uiState.update {
+                it.copy(
+                    attachedDoc = doc,
+                    isBrowserVisible = false,
+                    statusMessage = "📄 Текст страницы «${title.take(32)}» прикреплён к сообщению"
+                )
+            }
         }
     }
 
@@ -1399,7 +1513,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 if (isActiveEpoch()) {
                     _uiState.update { it.copy(termuxStatus = tStatus) }
                 }
-                AgentTools.buildAgentSystemPrompt(tStatus)
+                AgentTools.buildAgentSystemPrompt(tStatus, stateSnapshot.browserSearchEngine)
             } else {
                 ""
             }
@@ -1559,7 +1673,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
                             if (step < maxSteps) {
                                 // Выполняем запрошенные агентом инструменты (с подтверждением опасных действий!)
-                                val observation = executeAgentToolCalls(
+                                val batch = executeAgentToolCalls(
                                     calls = toolCalls,
                                     confirmMode = activeConfirmMode,
                                     agentSteps = agentSteps,
@@ -1576,10 +1690,12 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                                         AgentTools.buildAssistantTurnForHistory(stepRaw, toolCalls)
                                     )
                                 )
+                                val visionImages = if (activeProvider.supportsVision) batch.imageDataUrls else emptyList()
                                 apiMessages.add(
                                     ApiChatMessage(
-                                        "user",
-                                        "$observation\n\nПроанализируй результат и продолжи выполнение задачи (вызови следующий инструмент через <tool_call>, если нужно) или дай итоговый ответ пользователю на русском языке."
+                                        role = "user",
+                                        content = "${batch.observation}\n\nПроанализируй результат и продолжи выполнение задачи (вызови следующий инструмент через <tool_call>, если нужно) или дай итоговый ответ пользователю на русском языке.",
+                                        imageDataUrls = visionImages
                                     )
                                 )
                                 _uiState.update { it.copy(statusMessage = "Агент анализирует результат (шаг ${step + 1})...") }
@@ -1843,7 +1959,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     localConsecutiveRecoveries = 0
                     if (step == maxSteps) break
 
-                    val observation = executeAgentToolCalls(
+                    val batch = executeAgentToolCalls(
                         calls = toolCalls,
                         confirmMode = activeConfirmMode,
                         agentSteps = agentSteps,
@@ -1855,7 +1971,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     rolesList.add("assistant")
                     contentsList.add(AgentTools.buildAssistantTurnForHistory(stepRaw, toolCalls))
                     rolesList.add("user")
-                    contentsList.add("${observation.take(4000)}\n\nПродолжи задачу или ответь пользователю на русском языке.")
+                    contentsList.add("${batch.observation.take(4000)}\n\nПродолжи задачу или ответь пользователю на русском языке.")
                     continue
                 }
 
@@ -1950,14 +2066,20 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         return ThoughtParser.encodeAgentSteps(agentSteps)
     }
 
+    private data class ToolBatchResult(
+        val observation: String,
+        val imageDataUrls: List<String> = emptyList()
+    )
+
     private suspend fun executeAgentToolCalls(
         calls: List<AgentToolCall>,
         confirmMode: AgentConfirmationMode,
         agentSteps: MutableList<AgentStepLog>,
         assistantMsgId: String,
         isCancelled: () -> Boolean
-    ): String {
+    ): ToolBatchResult {
         val observations = StringBuilder()
+        val capturedImages = mutableListOf<String>()
 
         for (call in calls) {
             if (isCancelled()) break
@@ -2001,16 +2123,21 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
+            val isBrowserTool = call.tool.startsWith("browser_")
             _uiState.update {
                 it.copy(
-                    activeToolStatus = "⚙️ Выполняется: ${call.tool}...",
-                    statusMessage = "Агент выполняет ${call.tool}..."
+                    activeToolStatus = if (isBrowserTool) "🌐 Браузер: ${call.tool}..." else "⚙️ Выполняется: ${call.tool}...",
+                    statusMessage = if (isBrowserTool) "Агент работает в браузере (${call.tool})..." else "Агент выполняет ${call.tool}..."
                 )
             }
 
             val t0 = System.currentTimeMillis()
             val res = AgentTools.execute(getApplication(), call)
             val elapsedMs = System.currentTimeMillis() - t0
+
+            if (!res.imageDataUrl.isNullOrBlank()) {
+                capturedImages.add(res.imageDataUrl)
+            }
 
             agentSteps.add(
                 AgentStepLog(
@@ -2031,7 +2158,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         _uiState.update { it.copy(activeToolStatus = null) }
-        return observations.toString().trim()
+        return ToolBatchResult(observations.toString().trim(), capturedImages)
     }
 
     private fun updateAssistantStepsPreview(assistantMsgId: String, agentSteps: List<AgentStepLog>) {

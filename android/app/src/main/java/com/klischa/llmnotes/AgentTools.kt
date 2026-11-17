@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.MediaScannerConnection
 import android.os.Environment
 import android.util.Log
+import com.klischa.llmnotes.browser.AgentBrowserEngine
+import com.klischa.llmnotes.browser.BrowserSearchEngine
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -13,15 +15,15 @@ import java.util.Locale
 enum class AgentConfirmationMode(val title: String, val subtitle: String) {
     CONFIRM_DESTRUCTIVE(
         "Подтверждать опасные",
-        "Чтение, поиск и новые файлы — сразу; удаление, правка, перезапись и команды Termux — по кнопке"
+        "Чтение, поиск и навигация — сразу; удаление, правка, перезапись, Termux, ввод в формы, опасные клики и JS — по кнопке"
     ),
     CONFIRM_ALL(
         "Подтверждать все изменения",
-        "Любое создание, правка, удаление файла или команда Termux — только после подтверждения"
+        "Любое изменение файлов, команда Termux, клик, ввод текста или JS в браузере — только после подтверждения"
     ),
     AUTO(
         "Автоматически",
-        "Выполнять все операции с файлами и команды Termux без пауз на подтверждение"
+        "Выполнять все операции с файлами, браузером и Termux без пауз на подтверждение"
     )
 }
 
@@ -41,7 +43,8 @@ data class AgentToolResult(
     val tool: String,
     val ok: Boolean,
     val summary: String,
-    val output: String
+    val output: String,
+    val imageDataUrl: String? = null
 )
 
 data class PendingToolApproval(
@@ -120,7 +123,10 @@ object AgentTools {
     /**
      * Формирует системные инструкции агентного режима (универсальны для всех облачных API и локальных GGUF).
      */
-    fun buildAgentSystemPrompt(termuxStatus: TermuxStatus): String {
+    fun buildAgentSystemPrompt(
+        termuxStatus: TermuxStatus,
+        searchEngine: BrowserSearchEngine = BrowserSearchEngine.DUCKDUCKGO
+    ): String {
         val rootPath = storageRootCanonical()
         val termuxNote = when {
             termuxStatus.isInstalled && termuxStatus.hasRunPermission ->
@@ -132,15 +138,15 @@ object AgentTools {
         }
 
         return """
-[РЕЖИМ АГЕНТА — ДОСТУП К ФАЙЛАМ ТЕЛЕФОНА И TERMUX]
-У тебя есть реальные инструменты для работы с файлами во внутренней памяти смартфона ($rootPath, псевдоним /sdcard) и запуска команд через Termux ($termuxNote).
+[РЕЖИМ АГЕНТА — ФАЙЛЫ ТЕЛЕФОНА, ВСТРОЕННЫЙ БРАУЗЕР И TERMUX]
+У тебя есть реальные инструменты для работы с файлами во внутренней памяти смартфона ($rootPath, псевдоним /sdcard), встроенный интерактивный браузер (Chromium WebView с поддержкой JS, поисковик по умолчанию: ${searchEngine.displayName}) и запуск команд через Termux ($termuxNote).
 
 Чтобы вызвать инструмент, выведи блок строго в таком формате (один или несколько блоков подряд):
 <tool_call>
 {"tool": "имя_инструмента", "args": { ... }}
 </tool_call>
 
-Доступные инструменты:
+Доступные инструменты (файлы и Termux):
 1. list_dir — список файлов и папок:
    args: {"path": "/sdcard/Download", "recursive": false, "max_entries": 100}
 2. read_file — чтение файла (текст с нумерацией строк, а также PDF/DOCX/XLSX/ZIP/изображения):
@@ -162,12 +168,33 @@ object AgentTools {
 10. run_termux — выполнить команду bash/python/git/cli в Termux (возвращает exitCode, stdout, stderr):
    args: {"command": "python3 --version && ls -la", "workdir": "/storage/emulated/0", "timeout_sec": 35}
 
+Доступные инструменты (встроенный интерактивный браузер):
+11. browser_search — поиск в интернете (DuckDuckGo / Google / Яндекс):
+   args: {"query": "поисковый запрос", "engine": "${searchEngine.id}", "max_results": 8}
+12. browser_open — открыть веб-страницу в браузере (рендерит JS и сразу возвращает текст и пронумерованные элементы [1..N]):
+   args: {"url": "https://example.com", "wait_ms": 1400}
+13. browser_read — перечитать текст и список интерактивных элементов [1..N] текущей открытой страницы:
+   args: {"max_chars": 8000, "include_elements": true}
+14. browser_click — нажать на ссылку/кнопку по element_id (из browser_open/browser_read), CSS-селектору или тексту:
+   args: {"element_id": 5} (или {"text": "Подробнее"} или {"selector": "button.next"})
+15. browser_type — ввести текст в поле ввода и опционально нажать Enter:
+   args: {"element_id": 2, "text": "запрос", "press_enter": true, "clear": true}
+16. browser_scroll — прокрутить страницу ("down", "up", "top", "bottom"):
+   args: {"direction": "down", "amount": 700}
+17. browser_back — навигация по истории браузера ("back", "forward", "reload"):
+   args: {"action": "back"}
+18. browser_screenshot — снять скриншот открытой веб-страницы (Vision-модель увидит изображение; опционально сохранить в Download):
+   args: {"save_to_downloads": false}
+19. browser_eval_js — выполнить JavaScript в контексте текущей открытой страницы:
+   args: {"script": "return document.title;"}
+
 Правила работы агента:
-- Если пользователь просит создать, прочитать, изменить, найти или удалить файл, либо выполнить команду — СРАЗУ вызывай нужный инструмент через <tool_call>, а не просто пиши инструкцию словами.
-- Для обычных файловых операций в /sdcard предпочитай встроенные инструменты (write_file, edit_file, read_file, list_dir, delete_file, move_file, mkdir, search_files) — они работают мгновенно и без лишних зависимостей.
-- Используй run_termux для запуска скриптов (python, bash, node, git, pip, pkg, grep, sed, ffmpeg и т.д.) и операций внутри домашней директории Termux.
+- Если пользователь просит найти информацию в интернете, открыть сайт, проверить новости/цены/документацию или выполнить действие на сайте — СРАЗУ используй инструменты browser_search / browser_open / browser_click / browser_type / browser_read, а не отвечай «у меня нет доступа в интернет».
+- После browser_open и browser_click сразу возвращаются текст и пронумерованные элементы [1..N] — используй их element_id для точных кликов и ввода.
+- Если сайт требует вход в аккаунт или капчу, сообщи пользователю, что он может нажать «🌐 Браузер» в приложении, пройти проверку вручную, и затем продолжить.
+- Если пользователь просит создать, прочитать, изменить, найти или удалить файл, либо выполнить команду — СРАЗУ вызывай нужный инструмент через <tool_call>.
 - Перед edit_file сначала прочитай файл через read_file, чтобы old_text совпал точно.
-- После получения <tool_result> проанализируй результат и либо сделай следующий шаг, либо дай пользователю понятный итоговый ответ на русском языке.
+- После получения <tool_result> проанализируй результат и либо сделай следующий шаг, либо дай пользователю понятный итоговый ответ на русском языке (со ссылками на источники, если использовался браузер).
 - Если пользователь отклонил операцию ([Отклонено пользователем]), уважай его решение и не повторяй то же действие без новой просьбы.
         """.trimIndent()
     }
@@ -326,6 +353,15 @@ object AgentTools {
 
         val toolName = when (rawToolName) {
             "bash", "shell", "termux", "terminal", "exec" -> "run_termux"
+            "web_search", "search_web", "google_search", "search_internet", "internet_search" -> "browser_search"
+            "open_url", "fetch_page", "visit_url", "browser_navigate", "navigate", "browse" -> "browser_open"
+            "browser_get_page", "get_page", "read_page", "browser_snapshot" -> "browser_read"
+            "click", "click_element" -> "browser_click"
+            "type", "type_text", "fill_input", "browser_input", "input_text" -> "browser_type"
+            "scroll", "scroll_page" -> "browser_scroll"
+            "go_back", "browser_forward", "browser_reload", "browser_history" -> "browser_back"
+            "screenshot", "take_screenshot" -> "browser_screenshot"
+            "eval_js", "run_js", "execute_js" -> "browser_eval_js"
             else -> rawToolName
         }
 
@@ -350,6 +386,14 @@ object AgentTools {
                 }
                 flat
             }
+        }
+
+        if (rawToolName == "browser_forward" && !argsObj.has("action")) {
+            argsObj.put("action", "forward")
+        } else if (rawToolName == "browser_reload" && !argsObj.has("action")) {
+            argsObj.put("action", "reload")
+        } else if (rawToolName == "google_search" && !argsObj.has("engine")) {
+            argsObj.put("engine", "google")
         }
 
         return AgentToolCall(tool = toolName, args = argsObj, rawJson = candidate)
@@ -519,6 +563,29 @@ object AgentTools {
                 val workdir = a.optString("workdir", storageRootCanonical()).ifBlank { storageRootCanonical() }
                 "Каталог: $workdir\n$ $cmd"
             }
+            "browser_search" -> buildString {
+                append("Запрос: ${a.optString("query", "")}")
+                val eng = a.optString("engine", "").ifBlank { AgentBrowserEngine.state.value.searchEngine.displayName }
+                append("\nПоисковик: $eng")
+            }
+            "browser_open" -> "URL: ${a.optString("url", "")}"
+            "browser_read" -> "Текущий URL: ${AgentBrowserEngine.state.value.currentUrl.ifBlank { "(не открыт)" }}"
+            "browser_click" -> buildString {
+                if (a.has("element_id")) append("Элемент: [${a.optInt("element_id", -1)}]")
+                val t = a.optString("text", "")
+                val s = a.optString("selector", "")
+                if (t.isNotBlank()) append("${if (isNotEmpty()) "\n" else ""}Текст: $t")
+                if (s.isNotBlank()) append("${if (isNotEmpty()) "\n" else ""}Селектор: $s")
+            }
+            "browser_type" -> buildString {
+                if (a.has("element_id")) append("Элемент: [${a.optInt("element_id", -1)}]\n")
+                append("Текст: ${a.optString("text", "").take(200)}")
+                if (a.optBoolean("press_enter", false)) append("\nОтправка: Enter")
+            }
+            "browser_scroll" -> "Направление: ${a.optString("direction", "down")} (${a.optInt("amount", 700)} px)"
+            "browser_back" -> "Действие: ${a.optString("action", "back")}"
+            "browser_screenshot" -> "Сохранить в Download: ${if (a.optBoolean("save_to_downloads", false)) "да" else "нет"}"
+            "browser_eval_js" -> "JS:\n${a.optString("script", "").take(1000)}"
             else -> try {
                 a.toString(2).take(1200)
             } catch (_: Exception) {
@@ -564,7 +631,10 @@ object AgentTools {
     fun needsConfirmation(call: AgentToolCall, mode: AgentConfirmationMode): Boolean {
         if (mode == AgentConfirmationMode.AUTO) return false
 
-        val isReadOnly = call.tool in setOf("list_dir", "read_file", "search_files", "file_info")
+        val isReadOnly = call.tool in setOf(
+            "list_dir", "read_file", "search_files", "file_info",
+            "browser_search", "browser_open", "browser_read", "browser_scroll", "browser_back", "browser_screenshot"
+        )
         if (isReadOnly) return false
 
         if (mode == AgentConfirmationMode.CONFIRM_ALL) return true
@@ -572,6 +642,13 @@ object AgentTools {
         // Режим CONFIRM_DESTRUCTIVE (по умолчанию):
         return when (call.tool) {
             "delete_file", "edit_file", "move_file", "run_termux" -> true
+            "browser_eval_js", "browser_type" -> true
+            "browser_click" -> {
+                val elemId = if (call.args.has("element_id")) call.args.optInt("element_id", -1).takeIf { it > 0 } else null
+                val sel = call.args.optString("selector", "").ifBlank { null }
+                val txt = call.args.optString("text", "").ifBlank { null }
+                AgentBrowserEngine.analyzeClickSensitivity(elemId, sel, txt).first
+            }
             "write_file" -> {
                 // Создание нового файла — сразу; перезапись существующего — с подтверждением!
                 val pathStr = call.args.optString("path", "")
@@ -677,6 +754,50 @@ object AgentTools {
                     isHighRisk = true
                 )
             }
+            "browser_click" -> {
+                val elemId = if (call.args.has("element_id")) call.args.optInt("element_id", -1).takeIf { it > 0 } else null
+                val sel = call.args.optString("selector", "").ifBlank { null }
+                val txt = call.args.optString("text", "").ifBlank { null }
+                val (sensitive, desc) = AgentBrowserEngine.analyzeClickSensitivity(elemId, sel, txt)
+                val pageUrl = AgentBrowserEngine.state.value.currentUrl.ifBlank { "(страница не определена)" }
+                PendingToolApproval(
+                    call = call,
+                    title = "Клик в браузере",
+                    riskLabel = if (sensitive) "⚠️ Потенциально важное действие на сайте" else "🌐 Нажатие элемента в браузере",
+                    targetDisplay = desc,
+                    detailPreview = "Сайт: $pageUrl\nВы можете открыть «🌐 Браузер», чтобы проверить страницу визуально.",
+                    isHighRisk = sensitive
+                )
+            }
+            "browser_type" -> {
+                val elemId = if (call.args.has("element_id")) call.args.optInt("element_id", -1).takeIf { it > 0 } else null
+                val text = call.args.optString("text", "")
+                val enter = call.args.optBoolean("press_enter", false)
+                val pageUrl = AgentBrowserEngine.state.value.currentUrl.ifBlank { "(страница не определена)" }
+                val elemInfo = elemId?.let { AgentBrowserEngine.getElementInfo(it) }
+                val targetName = elemInfo?.let { "[${it.id}] ${it.label.ifBlank { it.tag }}" }
+                    ?: call.args.optString("selector", "").ifBlank { "активное поле ввода" }
+                PendingToolApproval(
+                    call = call,
+                    title = "Ввод текста в браузере",
+                    riskLabel = if (enter) "⌨️ Ввод текста и отправка (Enter)" else "⌨️ Заполнение поля на сайте",
+                    targetDisplay = "$targetName ← \"${text.take(120)}\"",
+                    detailPreview = "Сайт: $pageUrl\nПолный текст:\n${text.take(1000)}",
+                    isHighRisk = enter
+                )
+            }
+            "browser_eval_js" -> {
+                val script = call.args.optString("script", "")
+                val pageUrl = AgentBrowserEngine.state.value.currentUrl.ifBlank { "(страница не определена)" }
+                PendingToolApproval(
+                    call = call,
+                    title = "JavaScript в браузере",
+                    riskLabel = "⚡ Выполнение JS-кода на странице",
+                    targetDisplay = pageUrl,
+                    detailPreview = script.take(1500),
+                    isHighRisk = true
+                )
+            }
             else -> PendingToolApproval(
                 call = call,
                 title = "Действие агента: ${call.tool}",
@@ -704,11 +825,20 @@ object AgentTools {
                 "move_file" -> execMoveFile(context, call.args)
                 "delete_file" -> execDeleteFile(context, call.args)
                 "run_termux" -> execRunTermux(context, call.args)
+                "browser_search" -> execBrowserSearch(context, call.args)
+                "browser_open" -> execBrowserOpen(context, call.args)
+                "browser_read" -> execBrowserRead(context, call.args)
+                "browser_click" -> execBrowserClick(context, call.args)
+                "browser_type" -> execBrowserType(context, call.args)
+                "browser_scroll" -> execBrowserScroll(context, call.args)
+                "browser_back" -> execBrowserBack(context, call.args)
+                "browser_screenshot" -> execBrowserScreenshot(context, call.args)
+                "browser_eval_js" -> execBrowserEvalJs(context, call.args)
                 else -> AgentToolResult(
                     tool = call.tool,
                     ok = false,
                     summary = "Неизвестный инструмент '${call.tool}'",
-                    output = "Ошибка: инструмент '${call.tool}' не существует. Доступные: list_dir, read_file, search_files, file_info, mkdir, write_file, edit_file, move_file, delete_file, run_termux."
+                    output = "Ошибка: инструмент '${call.tool}' не существует. Доступные: list_dir, read_file, search_files, file_info, mkdir, write_file, edit_file, move_file, delete_file, run_termux, browser_search, browser_open, browser_read, browser_click, browser_type, browser_scroll, browser_back, browser_screenshot, browser_eval_js."
                 )
             }
         } catch (e: Exception) {
@@ -720,6 +850,89 @@ object AgentTools {
                 output = "Ошибка при выполнении ${call.tool}: ${e.message}"
             )
         }
+    }
+
+    // =========================================================================
+    // Инструменты встроенного браузера агента (WebView + Multi-Search)
+    // =========================================================================
+
+    private suspend fun execBrowserSearch(context: Context, args: JSONObject): AgentToolResult {
+        val query = args.optString("query", "").ifBlank { args.optString("q", "") }.trim()
+        val engine = args.optString("engine", "").ifBlank { null }
+        val maxResults = args.optInt("max_results", 8)
+        val res = AgentBrowserEngine.search(context, query, engine, maxResults)
+        return AgentToolResult("browser_search", res.ok, res.summary, res.output)
+    }
+
+    private suspend fun execBrowserOpen(context: Context, args: JSONObject): AgentToolResult {
+        val url = args.optString("url", "").ifBlank { args.optString("href", "") }.trim()
+        val waitMs = args.optLong("wait_ms", 1400L)
+        val res = AgentBrowserEngine.openUrl(context, url, waitMs)
+        return AgentToolResult("browser_open", res.ok, res.summary, res.output)
+    }
+
+    private suspend fun execBrowserRead(context: Context, args: JSONObject): AgentToolResult {
+        val maxChars = args.optInt("max_chars", 8000)
+        val includeElements = args.optBoolean("include_elements", true)
+        val res = AgentBrowserEngine.readPage(context, maxChars, includeElements)
+        return AgentToolResult("browser_read", res.ok, res.summary, res.output)
+    }
+
+    private suspend fun execBrowserClick(context: Context, args: JSONObject): AgentToolResult {
+        val elemId = if (args.has("element_id")) {
+            args.optInt("element_id", -1).takeIf { it > 0 }
+        } else if (args.has("id")) {
+            args.optInt("id", -1).takeIf { it > 0 }
+        } else null
+        val selector = args.optString("selector", "").ifBlank { null }
+        val text = args.optString("text", "").ifBlank { null }
+        val res = AgentBrowserEngine.clickElement(context, elemId, selector, text)
+        return AgentToolResult("browser_click", res.ok, res.summary, res.output)
+    }
+
+    private suspend fun execBrowserType(context: Context, args: JSONObject): AgentToolResult {
+        val elemId = if (args.has("element_id")) {
+            args.optInt("element_id", -1).takeIf { it > 0 }
+        } else if (args.has("id")) {
+            args.optInt("id", -1).takeIf { it > 0 }
+        } else null
+        val selector = args.optString("selector", "").ifBlank { null }
+        val text = args.optString("text", "").ifBlank { args.optString("value", "") }
+        val pressEnter = args.optBoolean("press_enter", false)
+        val clear = args.optBoolean("clear", true)
+        val res = AgentBrowserEngine.typeText(context, elemId, selector, text, pressEnter, clear)
+        return AgentToolResult("browser_type", res.ok, res.summary, res.output)
+    }
+
+    private suspend fun execBrowserScroll(context: Context, args: JSONObject): AgentToolResult {
+        val direction = args.optString("direction", "down")
+        val amount = args.optInt("amount", 700)
+        val res = AgentBrowserEngine.scrollPage(context, direction, amount)
+        return AgentToolResult("browser_scroll", res.ok, res.summary, res.output)
+    }
+
+    private suspend fun execBrowserBack(context: Context, args: JSONObject): AgentToolResult {
+        val action = args.optString("action", "back")
+        val res = AgentBrowserEngine.navigateHistory(context, action)
+        return AgentToolResult("browser_back", res.ok, res.summary, res.output)
+    }
+
+    private suspend fun execBrowserScreenshot(context: Context, args: JSONObject): AgentToolResult {
+        val save = args.optBoolean("save_to_downloads", false)
+        val res = AgentBrowserEngine.takeScreenshot(context, save)
+        return AgentToolResult(
+            tool = "browser_screenshot",
+            ok = res.ok,
+            summary = res.summary,
+            output = res.output,
+            imageDataUrl = res.screenshotDataUrl
+        )
+    }
+
+    private suspend fun execBrowserEvalJs(context: Context, args: JSONObject): AgentToolResult {
+        val script = args.optString("script", "").ifBlank { args.optString("code", "") }
+        val res = AgentBrowserEngine.evalJs(context, script)
+        return AgentToolResult("browser_eval_js", res.ok, res.summary, res.output)
     }
 
     // =========================================================================

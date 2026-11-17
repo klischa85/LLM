@@ -63,6 +63,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.klischa.llmnotes.AgentConfirmationMode
 import com.klischa.llmnotes.AgentStepLog
+import com.klischa.llmnotes.browser.AgentBrowserEngine
+import com.klischa.llmnotes.browser.BrowserSearchEngine
+import com.klischa.llmnotes.browser.BrowserUiState
 import com.klischa.llmnotes.ChatMessage
 import com.klischa.llmnotes.FileStorageManager
 import com.klischa.llmnotes.LLMViewModel
@@ -93,6 +96,7 @@ fun ChatScreen(
     onOpenStoragePermissionClick: () -> Unit = {}
 ) {
     val uiState = viewModel.uiState.collectAsState().value
+    val browserState = AgentBrowserEngine.state.collectAsState().value
     val listState = rememberLazyListState()
     val clipboardManager = LocalClipboardManager.current
     val context = LocalContext.current
@@ -165,8 +169,9 @@ fun ChatScreen(
         }
     }
 
-    ModalNavigationDrawer(
-        drawerState = drawerState,
+    Box(modifier = Modifier.fillMaxSize()) {
+        ModalNavigationDrawer(
+            drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet(
                 modifier = Modifier.width(310.dp)
@@ -419,11 +424,13 @@ fun ChatScreen(
                 // 2. Информационная плашка статуса модели и производительности
                 DeviceStatusStrip(uiState)
 
-                // 2.5. Панель быстрого управления: Режим размышления (Вкл/Выкл), Скиллы, Провайдер
+                // 2.5. Панель быстрого управления: Режим размышления (Вкл/Выкл), Скиллы, Браузер, Провайдер, Агент
                 QuickControlsBar(
                     uiState = uiState,
+                    browserState = browserState,
                     onToggleThinking = { viewModel.toggleThinkingEnabled() },
                     onOpenSkills = { viewModel.setSkillsDialogVisible(true) },
+                    onOpenBrowser = { viewModel.setBrowserVisible(true) },
                     onOpenProviders = { viewModel.setProviderDialogVisible(true) },
                     onOpenAgent = { viewModel.setAgentDialogVisible(true) }
                 )
@@ -469,15 +476,18 @@ fun ChatScreen(
                     }
                 }
 
-                // 3.5. Интерактивная карточка подтверждения опасных действий агента (удаление, правка, перезапись, Termux)
+                // 3.5. Интерактивная карточка подтверждения опасных действий агента (файлы, браузер, Termux)
                 val approval = uiState.pendingToolApproval
                 if (approval != null) {
                     ToolApprovalCard(
                         approval = approval,
                         onApprove = { viewModel.approveToolCall() },
-                        onDeny = { viewModel.denyToolCall() }
+                        onDeny = { viewModel.denyToolCall() },
+                        onOpenBrowser = { viewModel.setBrowserVisible(true) }
                     )
                 } else if (!uiState.activeToolStatus.isNullOrBlank()) {
+                    val isBrowserActive = uiState.activeToolStatus.contains("Браузер") ||
+                        uiState.activeToolStatus.contains("browser_")
                     Surface(
                         color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
                         shape = RoundedCornerShape(10.dp),
@@ -499,8 +509,17 @@ fun ChatScreen(
                                 text = uiState.activeToolStatus,
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                maxLines = 1
+                                maxLines = 1,
+                                modifier = Modifier.weight(1f)
                             )
+                            if (isBrowserActive) {
+                                TextButton(
+                                    onClick = { viewModel.setBrowserVisible(true) },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                                ) {
+                                    Text("Открыть 🌐", fontSize = 11.sp)
+                                }
+                            }
                         }
                     }
                 }
@@ -527,6 +546,22 @@ fun ChatScreen(
                 )
             }
         }
+        }
+
+        // Полноценный встроенный интерактивный браузер агента (живой WebView, мгновенное открытие/сворачивание)
+        AgentBrowserOverlay(
+            visible = uiState.isBrowserVisible,
+            browserState = browserState,
+            isAgentGenerating = uiState.isGenerating,
+            onClose = { viewModel.setBrowserVisible(false) },
+            onStopAgent = { viewModel.stopGeneration() },
+            onSelectSearchEngine = { viewModel.setBrowserSearchEngine(it) },
+            onToggleIncognito = { viewModel.setBrowserIncognitoMode(it) },
+            onToggleDesktopMode = { viewModel.setBrowserDesktopMode(it) },
+            onClearCookies = { viewModel.clearBrowserData() },
+            onAttachScreenshotToChat = { viewModel.attachBrowserScreenshotToChat() },
+            onAttachTextToChat = { viewModel.attachBrowserTextToChat() }
+        )
     }
 }
 
@@ -633,8 +668,10 @@ fun DeviceStatusStrip(uiState: UiState) {
 @Composable
 fun QuickControlsBar(
     uiState: UiState,
+    browserState: BrowserUiState,
     onToggleThinking: () -> Unit,
     onOpenSkills: () -> Unit,
+    onOpenBrowser: () -> Unit,
     onOpenProviders: () -> Unit,
     onOpenAgent: () -> Unit
 ) {
@@ -668,6 +705,22 @@ fun QuickControlsBar(
                     text = "🧩 Скиллы$badge",
                     fontSize = 11.sp
                 )
+            }
+        )
+
+        // Встроенный интерактивный браузер агента
+        FilterChip(
+            selected = browserState.hasLoadedPage || !browserState.agentActionLabel.isNullOrBlank(),
+            onClick = onOpenBrowser,
+            label = {
+                val icon = if (browserState.incognitoMode) "🕵️" else "🌐"
+                val host = browserState.shortHost
+                val labelText = when {
+                    !browserState.agentActionLabel.isNullOrBlank() -> "$icon Браузер • активен"
+                    host.isNotBlank() -> "$icon ${host.take(18)}"
+                    else -> "$icon Браузер"
+                }
+                Text(text = labelText, fontSize = 11.sp)
             }
         )
 
@@ -2364,7 +2417,8 @@ fun ChatInputBar(
 fun ToolApprovalCard(
     approval: PendingToolApproval,
     onApprove: () -> Unit,
-    onDeny: () -> Unit
+    onDeny: () -> Unit,
+    onOpenBrowser: () -> Unit = {}
 ) {
     val borderColor = if (approval.isHighRisk) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
     val containerColor = if (approval.isHighRisk) {
@@ -2468,6 +2522,18 @@ fun ToolApprovalCard(
                 }
             }
 
+            if (approval.call.tool.startsWith("browser_")) {
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onOpenBrowser,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Text("🌐 Открыть браузер и проверить страницу", fontSize = 11.5.sp)
+                }
+            }
+
             Spacer(modifier = Modifier.height(10.dp))
 
             Row(
@@ -2516,7 +2582,7 @@ fun AgentSettingsDialog(
         onDismissRequest = onDismiss,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("🤖 Агент: файлы и Termux", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
+                Text("🤖 Агент: файлы, браузер и Termux", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
             }
         },
         text = {
@@ -2538,7 +2604,7 @@ fun AgentSettingsDialog(
                             style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
                         )
                         Text(
-                            text = "Создание, правка, поиск, удаление файлов в /sdcard и команды в Termux",
+                            text = "Файлы в /sdcard, встроенный интерактивный веб-браузер и команды в Termux",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -2547,6 +2613,81 @@ fun AgentSettingsDialog(
                         checked = uiState.agentModeEnabled,
                         onCheckedChange = { viewModel.setAgentModeEnabled(it) }
                     )
+                }
+
+                HorizontalDivider()
+
+                // Настройки встроенного браузера агента
+                Text(
+                    text = "🌐 Встроенный браузер агента:",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                )
+                Text(
+                    text = "Поисковик по умолчанию (можно также менять в самом браузере):",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    BrowserSearchEngine.values().forEach { engine ->
+                        FilterChip(
+                            selected = uiState.browserSearchEngine == engine,
+                            onClick = { viewModel.setBrowserSearchEngine(engine) },
+                            label = { Text(engine.chipLabel, fontSize = 11.sp) }
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "🕵️ Режим Инкогнито",
+                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold)
+                        )
+                        Text(
+                            text = "Если выкл. — входы на сайты и куки сохраняются; если вкл. — сессия чистится автоматически",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = uiState.browserIncognitoMode,
+                        onCheckedChange = { viewModel.setBrowserIncognitoMode(it) }
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            onDismiss()
+                            viewModel.setBrowserVisible(true)
+                        },
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("🌐 Открыть браузер", fontSize = 11.sp)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.clearBrowserData()
+                            Toast.makeText(context, "🧹 Куки и кэш браузера очищены", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("🧹 Очистить куки", fontSize = 11.sp)
+                    }
                 }
 
                 HorizontalDivider()
