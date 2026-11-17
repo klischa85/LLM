@@ -12,7 +12,7 @@ import kotlin.coroutines.coroutineContext
 
 /**
  * Загрузка GGUF-моделей напрямую с huggingface.co.
- * Поддерживает докачку (.part + HTTP Range), отмену и проверку свободного места.
+ * Поддерживает докачку (.part + HTTP Range + автосброс при HTTP 416), отмену и проверку свободного места.
  */
 class ModelDownloader(private val context: Context) {
 
@@ -48,30 +48,49 @@ class ModelDownloader(private val context: Context) {
     fun availableBytes(): Long = context.filesDir.usableSpace
 
     fun canAfford(model: ModelInfo): Boolean {
-        val need = model.sizeBytes - partFile(model).length()
+        val need = (model.sizeBytes - partFile(model).length()).coerceAtLeast(0L)
         return availableBytes() > need + 150L * 1024L * 1024L
+    }
+
+    private fun openConnection(urlStr: String, rangeStart: Long): HttpURLConnection {
+        return (URL(urlStr).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 20_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "LLMNotes-Android/1.3.8")
+            if (rangeStart > 0L) {
+                setRequestProperty("Range", "bytes=$rangeStart-")
+            }
+        }
     }
 
     /**
      * Качает модель. Бросает CancellationException при отмене корутины,
      * .part сохраняется — следующий запуск продолжит с места обрыва.
+     * Все вызовы `onProgress` выполняются безопасно на Dispatchers.Main.
      */
     suspend fun download(
         model: ModelInfo,
         onProgress: (Progress) -> Unit
     ): File = withContext(Dispatchers.IO) {
+        suspend fun notifyProgress(p: Progress) {
+            withContext(Dispatchers.Main) {
+                onProgress(p)
+            }
+        }
+
         val target = targetFile(model)
         val part = partFile(model)
 
         if (target.exists() && target.length() > 0L) {
-            onProgress(Progress(model.id, target.length(), target.length(), done = true))
+            notifyProgress(Progress(model.id, target.length(), target.length(), done = true))
             return@withContext target
         }
 
         if (!canAfford(model)) {
             val msg = "Недостаточно места: нужно ~${ModelCatalog.formatSize(model.sizeBytes)}, " +
                 "свободно ${ModelCatalog.formatSize(availableBytes())}"
-            onProgress(Progress(model.id, error = msg))
+            notifyProgress(Progress(model.id, error = msg))
             throw IllegalStateException(msg)
         }
 
@@ -80,18 +99,21 @@ class ModelDownloader(private val context: Context) {
 
         var conn: HttpURLConnection? = null
         try {
-            conn = (URL(model.url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 20_000
-                readTimeout = 30_000
-                instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "LLMNotes-Android/1.0")
-                if (downloaded > 0L) setRequestProperty("Range", "bytes=$downloaded-")
+            conn = openConnection(model.url, downloaded)
+            var code = conn.responseCode
+
+            // Если .part устарел или больше/равен файлу на сервере (HTTP 416 Range Not Satisfiable) — сбрасываем и качаем заново
+            if (code == 416 && downloaded > 0L) {
+                conn.disconnect()
+                part.delete()
+                downloaded = 0L
+                conn = openConnection(model.url, 0L)
+                code = conn.responseCode
             }
 
-            val code = conn.responseCode
             if (code !in 200..299) {
                 val msg = "HTTP $code — не удалось начать загрузку"
-                onProgress(Progress(model.id, downloaded, total, error = msg))
+                notifyProgress(Progress(model.id, downloaded, total, error = msg))
                 throw IllegalStateException(msg)
             }
 
@@ -105,7 +127,7 @@ class ModelDownloader(private val context: Context) {
                 part.delete()
             }
 
-            onProgress(Progress(model.id, downloaded, total))
+            notifyProgress(Progress(model.id, downloaded, total))
 
             conn.inputStream.use { input ->
                 RandomAccessFile(part, "rw").use { raf ->
@@ -121,7 +143,7 @@ class ModelDownloader(private val context: Context) {
                         val now = System.currentTimeMillis()
                         if (now - lastNotify > 200L) {
                             lastNotify = now
-                            onProgress(Progress(model.id, downloaded, total))
+                            notifyProgress(Progress(model.id, downloaded, total))
                         }
                     }
                 }
@@ -129,12 +151,12 @@ class ModelDownloader(private val context: Context) {
 
             if (total > 0L && downloaded < total) {
                 val msg = "Загрузка прервана: ${ModelCatalog.formatSize(downloaded)} из ${ModelCatalog.formatSize(total)}"
-                onProgress(Progress(model.id, downloaded, total, error = msg))
+                notifyProgress(Progress(model.id, downloaded, total, error = msg))
                 throw IllegalStateException(msg)
             }
 
             if (part.length() <= 0L) {
-                onProgress(Progress(model.id, 0, total, error = "Файл пустой"))
+                notifyProgress(Progress(model.id, 0, total, error = "Файл пустой"))
                 throw IllegalStateException("Файл пустой")
             }
 
@@ -144,7 +166,7 @@ class ModelDownloader(private val context: Context) {
                 part.delete()
             }
 
-            onProgress(Progress(model.id, target.length(), target.length(), done = true))
+            notifyProgress(Progress(model.id, target.length(), target.length(), done = true))
             target
         } finally {
             conn?.disconnect()

@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -25,6 +26,7 @@ import com.klischa.llmnotes.ModelCatalog
 import com.klischa.llmnotes.ModelDownloader
 import com.klischa.llmnotes.ModelInfo
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
@@ -56,8 +58,14 @@ fun ModelStoreDialog(
     }
     var freeBytes by remember { mutableStateOf(downloader.availableBytes()) }
     var progressMap by remember { mutableStateOf<Map<String, ModelDownloader.Progress>>(emptyMap()) }
-    var activeJob by remember { mutableStateOf<Job?>() }
-    var activeId by remember { mutableStateOf<String?>() }
+    var activeJob by remember { mutableStateOf<Job?>(null) }
+    var activeId by remember { mutableStateOf<String?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            activeJob?.cancel()
+        }
+    }
 
     fun close() {
         activeJob?.cancel()
@@ -81,20 +89,20 @@ fun ModelStoreDialog(
                 modifier = Modifier.heightIn(max = 460.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(ModelCatalog.models) { model ->
+                items(ModelCatalog.models, key = { it.id }) { model ->
                     ModelCard(
                         model = model,
                         ramGb = ramGb,
                         isInstalled = installed[model.id] == true,
                         progress = progressMap[model.id],
-                        isBusy = activeId == model.id,
+                        isBusy = activeId != null,
                         onDownload = {
                             if (activeId != null) return@ModelCard
                             activeId = model.id
                             progressMap = progressMap + (
                                 model.id to ModelDownloader.Progress(model.id, 0L, model.sizeBytes)
                             )
-                            activeJob = scope.launch {
+                            activeJob = scope.launch(Dispatchers.Main) {
                                 try {
                                     val file = downloader.download(model) { p ->
                                         progressMap = progressMap + (model.id to p)
@@ -158,7 +166,8 @@ private fun ModelCard(
     onDelete: () -> Unit
 ) {
     val compatible = model.minRamGb <= ramGb
-    val downloading = progress != null && !progress.done && progress.error == null
+    val activeProgress = progress?.takeIf { !it.done && it.error == null }
+    val errorText = progress?.error
 
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(10.dp)) {
@@ -195,16 +204,16 @@ private fun ModelCard(
                 )
             }
 
-            if (progress?.error != null) {
+            if (errorText != null) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = progress.error!!,
+                    text = errorText,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error
                 )
             }
 
-            if (downloading) {
+            if (activeProgress != null) {
                 Spacer(Modifier.height(8.dp))
                 Box(
                     modifier = Modifier
@@ -215,7 +224,7 @@ private fun ModelCard(
                 ) {
                     Box(
                         modifier = Modifier
-                            .fillMaxWidth(progress.percent)
+                            .fillMaxWidth(activeProgress.percent)
                             .fillMaxHeight()
                             .background(MaterialTheme.colorScheme.primary)
                     )
@@ -223,8 +232,8 @@ private fun ModelCard(
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "${(progress.percent * 100).toInt()}% • " +
-                            "${ModelCatalog.formatSize(progress.bytes)} / ${ModelCatalog.formatSize(progress.total)}",
+                        text = "${(activeProgress.percent * 100).toInt()}% • " +
+                            "${ModelCatalog.formatSize(activeProgress.bytes)} / ${ModelCatalog.formatSize(activeProgress.total)}",
                         style = MaterialTheme.typography.labelSmall,
                         modifier = Modifier.weight(1f)
                     )
@@ -238,15 +247,15 @@ private fun ModelCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 when {
-                    downloading -> { /* кнопки уже показаны в строке прогресса */ }
+                    activeProgress != null -> { /* кнопки уже показаны в строке прогресса */ }
                     isInstalled -> {
-                        Button(onClick = onUse) { Text("Загрузить", fontSize = 12.sp) }
-                        TextButton(onClick = onDelete) { Text("Удалить", fontSize = 12.sp) }
+                        Button(onClick = onUse, enabled = !isBusy) { Text("Загрузить", fontSize = 12.sp) }
+                        TextButton(onClick = onDelete, enabled = !isBusy) { Text("Удалить", fontSize = 12.sp) }
                     }
                     else -> {
                         Button(onClick = onDownload, enabled = !isBusy) {
                             Text(
-                                text = if (progress?.error != null) "Повторить" else "Скачать",
+                                text = if (errorText != null) "Повторить" else "Скачать",
                                 fontSize = 12.sp
                             )
                         }
