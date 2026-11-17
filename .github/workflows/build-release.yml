@@ -47,8 +47,30 @@ jobs:
             "ndk;26.1.10909125" \
             "cmake;3.22.1"
 
+      - name: Decode permanent release signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEY_PASSWORD" ]; then
+            echo "::error::Missing Android release signing secrets (ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD)!"
+            exit 1
+          fi
+          KEYSTORE_PATH="${RUNNER_TEMP}/llmnotes-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$ANDROID_KEYSTORE_PASSWORD" -alias "$ANDROID_KEY_ALIAS" | grep -E "Alias name:|Certificate fingerprint|SHA256" || true
+          echo "ANDROID_KEYSTORE_FILE=${KEYSTORE_PATH}" >> "$GITHUB_ENV"
+
       - name: Build Release APK with Gradle
         working-directory: ./android
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ env.ANDROID_KEYSTORE_FILE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -o pipefail
           gradle :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log || {
@@ -89,6 +111,25 @@ jobs:
           echo "apk_path=$OUT_APK" >> "$GITHUB_OUTPUT"
           echo "apk_sha256=${OUT_APK}.sha256" >> "$GITHUB_OUTPUT"
           echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify permanent release APK signature
+        run: |
+          APKSIGNER="${ANDROID_HOME}/build-tools/34.0.0/apksigner"
+          CERT_OUT=$("$APKSIGNER" verify --print-certs "${{ steps.find_apk.outputs.apk_path }}")
+          echo "$CERT_OUT"
+          if echo "$CERT_OUT" | grep -qi "Android Debug"; then
+            echo "::error::APK was signed with an ephemeral Android Debug key instead of the permanent release keystore!"
+            exit 1
+          fi
+          if ! echo "$CERT_OUT" | grep -qi "d4d59c539ae69972afba5327cda0f50145606aa0d35cc6dccb7a820c79de0883"; then
+            echo "::error::APK certificate SHA-256 fingerprint does not match the permanent release key!"
+            exit 1
+          fi
+          echo "Verified permanent release certificate (in-place updates enabled)."
+
+      - name: Remove temporary keystore
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/llmnotes-release.jks"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4

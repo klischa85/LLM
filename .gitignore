@@ -16,6 +16,9 @@ build/
 app/build/
 *.apk
 *.aab
+*.jks
+*.keystore
+KEYSTORE-README.txt
 .idea/
 *.iml
 local.properties

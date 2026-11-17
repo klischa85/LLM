@@ -383,7 +383,7 @@ object SkillManager {
                     connectTimeout = 12_000
                     readTimeout = 15_000
                     instanceFollowRedirects = true
-                    setRequestProperty("User-Agent", "LLMNotes-Android/1.3.9")
+                    setRequestProperty("User-Agent", "LLMNotes-Android/1.3.10")
                     setRequestProperty("Accept", "text/plain, text/markdown, */*")
                 }
                 val code = conn.responseCode
@@ -456,7 +456,7 @@ object SkillManager {
                 requestMethod = "GET"
                 connectTimeout = 10_000
                 readTimeout = 12_000
-                setRequestProperty("User-Agent", "LLMNotes-Android/1.3.9")
+                setRequestProperty("User-Agent", "LLMNotes-Android/1.3.10")
                 setRequestProperty("Accept", "application/vnd.github+json")
             }
             if (conn.responseCode in 200..299) {
