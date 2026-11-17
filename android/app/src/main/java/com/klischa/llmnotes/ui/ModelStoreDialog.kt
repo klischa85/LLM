@@ -56,8 +56,8 @@ fun ModelStoreDialog(
     }
     var freeBytes by remember { mutableStateOf(downloader.availableBytes()) }
     var progressMap by remember { mutableStateOf<Map<String, ModelDownloader.Progress>>(emptyMap()) }
-    var activeJob by remember { mutableStateOf<Job?>() }
-    var activeId by remember { mutableStateOf<String?>() }
+    var activeJob by remember { mutableStateOf<Job?``>() }
+    var activeId by remember { mutableStateOf<String?``>() }
 
     fun close() {
         activeJob?.cancel()
