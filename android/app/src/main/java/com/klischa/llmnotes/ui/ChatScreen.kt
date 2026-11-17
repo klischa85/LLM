@@ -29,6 +29,8 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -36,6 +38,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -58,6 +61,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.klischa.llmnotes.AgentConfirmationMode
+import com.klischa.llmnotes.AgentStepLog
 import com.klischa.llmnotes.ChatMessage
 import com.klischa.llmnotes.FileStorageManager
 import com.klischa.llmnotes.LLMViewModel
@@ -94,6 +98,24 @@ fun ChatScreen(
     val coroutineScope = rememberCoroutineScope()
     var chatSearchQuery by remember { mutableStateOf("") }
     var showModelStore by remember { mutableStateOf(false) }
+    var pendingRollbackMessage by remember { mutableStateOf<ChatMessage?>(null) }
+
+    // Диалог подтверждения отмены отправленного сообщения и отката чата до этого момента
+    val rollbackTarget = pendingRollbackMessage
+    if (rollbackTarget != null) {
+        val targetIndex = uiState.messages.indexOfFirst { it.id == rollbackTarget.id }
+        val affectedCount = if (targetIndex >= 0) uiState.messages.size - targetIndex else 0
+        RollbackConfirmDialog(
+            message = rollbackTarget,
+            affectedCount = affectedCount,
+            onConfirm = { restoreToInput ->
+                viewModel.rollbackToMessage(rollbackTarget.id, restoreToInput = restoreToInput)
+                pendingRollbackMessage = null
+                Toast.makeText(context, "Чат откачен", Toast.LENGTH_SHORT).show()
+            },
+            onDismiss = { pendingRollbackMessage = null }
+        )
+    }
 
     // Диалог настройки провайдеров (DeepSeek, OpenRouter, Groq, OpenCode GO/ZEN, локальный GGUF)
     if (uiState.isProviderDialogVisible) {
@@ -408,11 +430,15 @@ fun ChatScreen(
                                 ChatMessageBubble(
                                     message = message,
                                     onCopyClick = {
-                                        val cleanToCopy = ThoughtParser.cleanStopTokens(message.text)
-                                        val answerOnly = ThoughtParser.parse(cleanToCopy, false).answerText
-                                        val textToCopy = if (answerOnly.isNotBlank()) answerOnly else cleanToCopy
+                                        val parsedCopy = ThoughtParser.parse(message.text, false)
+                                        val textToCopy = parsedCopy.answerText.ifBlank {
+                                            ThoughtParser.cleanStopTokens(message.text)
+                                        }
                                         clipboardManager.setText(AnnotatedString(textToCopy))
                                         Toast.makeText(context, "Текст ответа скопирован", Toast.LENGTH_SHORT).show()
+                                    },
+                                    onRollbackClick = {
+                                        pendingRollbackMessage = message
                                     }
                                 )
                             }
@@ -979,7 +1005,8 @@ fun ProviderSettingsDialog(
 @Composable
 fun ChatMessageBubble(
     message: ChatMessage,
-    onCopyClick: () -> Unit
+    onCopyClick: () -> Unit,
+    onRollbackClick: () -> Unit = {}
 ) {
     val isUser = message.role == MessageRole.USER
     val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -993,7 +1020,6 @@ fun ChatMessageBubble(
 
     val displayAnswer = parsed.answerText
     var isThoughtExpanded by remember(message.id) { mutableStateOf(false) }
-    var isAgentStepsExpanded by remember(message.id) { mutableStateOf(false) }
 
     val codeBlocks = remember(displayAnswer) {
         if (!isUser) FileStorageManager.extractCodeBlocks(displayAnswer) else emptyList()
@@ -1016,7 +1042,7 @@ fun ChatMessageBubble(
                     MaterialTheme.colorScheme.surfaceVariant
                 }
             ),
-            modifier = Modifier.widthIn(min = 80.dp, max = 320.dp)
+            modifier = Modifier.widthIn(min = 80.dp, max = if (!isUser && parsed.agentSteps.isNotEmpty()) 350.dp else 325.dp)
         ) {
             Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
                 // Роль собеседника
@@ -1028,53 +1054,13 @@ fun ChatMessageBubble(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
-                // Блок выполненных шагов агента (файлы и Termux)
-                if (!isUser && parsed.agentStepsText != null) {
-                    val stepLines = remember(parsed.agentStepsText) {
-                        parsed.agentStepsText.lines().filter { it.isNotBlank() }
-                    }
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 6.dp)
-                            .clickable { isAgentStepsExpanded = !isAgentStepsExpanded },
-                        shape = RoundedCornerShape(8.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
-                        )
-                    ) {
-                        Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "🛠️ Действия агента (${stepLines.size})",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                Text(
-                                    text = if (isAgentStepsExpanded || message.isStreaming) "Свернуть ▲" else "Показать ▼",
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                            }
-                            if (isAgentStepsExpanded || message.isStreaming) {
-                                Spacer(modifier = Modifier.height(4.dp))
-                                stepLines.forEach { stepLine ->
-                                    Text(
-                                        text = stepLine,
-                                        style = MaterialTheme.typography.bodySmall.copy(
-                                            fontSize = 11.sp,
-                                            lineHeight = 16.sp
-                                        ),
-                                        color = MaterialTheme.colorScheme.onSecondaryContainer
-                                    )
-                                }
-                            }
-                        }
-                    }
+                // Блок выполненных действий агента — разворачивается и список, и каждое действие с параметрами и результатом
+                if (!isUser && parsed.agentSteps.isNotEmpty()) {
+                    AgentStepsSection(
+                        messageId = message.id,
+                        steps = parsed.agentSteps,
+                        isStreaming = message.isStreaming
+                    )
                 }
 
                 // Индикатор подготовки команды агента во время стриминга
@@ -1249,7 +1235,7 @@ fun ChatMessageBubble(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
-                // Нижняя строка: скорость, кнопка копирования и время
+                // Нижняя строка: скорость / кнопка отката, кнопка копирования и время
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1261,6 +1247,20 @@ fun ChatMessageBubble(
                             fontSize = 10.sp,
                             color = MaterialTheme.colorScheme.primary
                         )
+                    } else if (isUser) {
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                            modifier = Modifier.clickable { onRollbackClick() }
+                        ) {
+                            Text(
+                                text = "↩ Отменить",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                            )
+                        }
                     } else {
                         Spacer(modifier = Modifier.width(1.dp))
                     }
@@ -1288,6 +1288,368 @@ fun ChatMessageBubble(
             }
         }
     }
+}
+
+@Composable
+fun AgentStepsSection(
+    messageId: String,
+    steps: List<AgentStepLog>,
+    isStreaming: Boolean
+) {
+    var isSectionExpanded by remember(messageId) { mutableStateOf(false) }
+    val expandedSteps = remember(messageId) { mutableStateMapOf<Int, Boolean>() }
+    val showList = isSectionExpanded || isStreaming
+
+    val okCount = remember(steps) { steps.count { it.status == "ok" } }
+    val errCount = remember(steps) { steps.count { it.status == "error" } }
+    val deniedCount = remember(steps) { steps.count { it.status == "denied" } }
+    val hasAnyDetails = remember(steps) { steps.any { it.argsPreview.isNotBlank() || it.output.isNotBlank() } }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 6.dp),
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { isSectionExpanded = !isSectionExpanded },
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        text = "🛠️ Действия агента (${steps.size})",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    if (errCount > 0 || deniedCount > 0) {
+                        val badgeParts = buildList {
+                            if (okCount > 0) add("✅$okCount")
+                            if (errCount > 0) add("❌$errCount")
+                            if (deniedCount > 0) add("⛔$deniedCount")
+                        }.joinToString(" ")
+                        Text(
+                            text = badgeParts,
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+                        )
+                    }
+                }
+                Text(
+                    text = if (showList) "Свернуть ▲" else "Развернуть ▼",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            AnimatedVisibility(visible = showList) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    if (steps.size > 1 && hasAnyDetails) {
+                        val allExpanded = steps.all { expandedSteps[it.index] == true }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            Text(
+                                text = if (allExpanded) "Свернуть все детали" else "Развернуть все детали",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .clickable {
+                                        val target = !allExpanded
+                                        steps.forEach { expandedSteps[it.index] = target }
+                                    }
+                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
+                    steps.forEach { step ->
+                        val isStepExpanded = expandedSteps[step.index] == true
+                        AgentStepItemCard(
+                            step = step,
+                            expanded = isStepExpanded,
+                            onToggle = { expandedSteps[step.index] = !isStepExpanded }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AgentStepItemCard(
+    step: AgentStepLog,
+    expanded: Boolean,
+    onToggle: () -> Unit
+) {
+    val context = LocalContext.current
+    val hasDetails = step.argsPreview.isNotBlank() || step.output.isNotBlank()
+    val statusIcon = when (step.status) {
+        "ok" -> "✅"
+        "denied" -> "⛔"
+        else -> "❌"
+    }
+    val durationLabel = when {
+        step.durationMs <= 0L -> null
+        step.durationMs < 1000L -> "${step.durationMs} мс"
+        else -> String.format(Locale.US, "%.1f с", step.durationMs / 1000f)
+    }
+
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.78f),
+        border = BorderStroke(
+            width = 1.dp,
+            color = when (step.status) {
+                "error" -> MaterialTheme.colorScheme.error.copy(alpha = 0.35f)
+                "denied" -> Color(0xFFD97706).copy(alpha = 0.35f)
+                else -> MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+            }
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .then(if (hasDetails) Modifier.clickable { onToggle() } else Modifier),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                Text(text = statusIcon, fontSize = 11.sp)
+
+                if (step.tool.isNotBlank() && step.tool != "agent") {
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = step.tool,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+
+                Text(
+                    text = step.summary,
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp
+                    ),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = if (expanded) Int.MAX_VALUE else 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+
+                if (durationLabel != null) {
+                    Text(
+                        text = durationLabel,
+                        fontSize = 9.5.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f)
+                    )
+                }
+
+                if (hasDetails) {
+                    Icon(
+                        imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                        contentDescription = if (expanded) "Свернуть действие" else "Развернуть действие",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+
+            AnimatedVisibility(visible = expanded && hasDetails) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (step.argsPreview.isNotBlank()) {
+                        Text(
+                            text = "Параметры:",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp
+                            ),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            SelectionContainer {
+                                Text(
+                                    text = step.argsPreview,
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 10.5.sp,
+                                        lineHeight = 14.sp
+                                    ),
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 170.dp)
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(6.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    if (step.output.isNotBlank()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Результат:",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                ),
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                            Text(
+                                text = "📋 Копировать",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .clickable {
+                                        FileStorageManager.copyToClipboard(context, step.output)
+                                        Toast.makeText(context, "Результат действия скопирован", Toast.LENGTH_SHORT).show()
+                                    }
+                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            SelectionContainer {
+                                Text(
+                                    text = step.output,
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 10.5.sp,
+                                        lineHeight = 14.sp
+                                    ),
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 220.dp)
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(6.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun RollbackConfirmDialog(
+    message: ChatMessage,
+    affectedCount: Int,
+    onConfirm: (Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var restoreToInput by remember(message.id) { mutableStateOf(true) }
+    val preview = remember(message.text) {
+        val clean = message.text.trim()
+        if (clean.length > 140) clean.take(140) + "…" else clean
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = "↩️ Откатить чат?",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Выбранное сообщение и все последующие сообщения после него (всего: $affectedCount) будут удалены из истории диалога.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = preview,
+                        style = MaterialTheme.typography.bodySmall.copy(fontStyle = FontStyle.Italic),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(8.dp),
+                        maxLines = 4,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { restoreToInput = !restoreToInput },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = restoreToInput,
+                        onCheckedChange = { restoreToInput = it }
+                    )
+                    Text(
+                        text = "Вернуть текст сообщения в поле ввода",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Отмена")
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onConfirm(restoreToInput) },
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text("Откатить")
+            }
+        }
+    )
 }
 
 @Composable
@@ -1563,6 +1925,13 @@ fun ToolApprovalCard(
     } else {
         MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
     }
+    var isDetailsExpanded by remember(approval) { mutableStateOf(false) }
+    val targetScrollState = rememberScrollState()
+    val detailScrollState = rememberScrollState()
+    val canExpand = approval.targetDisplay.length > 100 ||
+        approval.targetDisplay.count { it == '\n' } >= 3 ||
+        approval.detailPreview.length > 140 ||
+        approval.detailPreview.count { it == '\n' } >= 4
 
     Card(
         modifier = Modifier
@@ -1573,11 +1942,29 @@ fun ToolApprovalCard(
         colors = CardDefaults.cardColors(containerColor = containerColor)
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
-            Text(
-                text = approval.riskLabel,
-                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                color = if (approval.isHighRisk) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = approval.riskLabel,
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = if (approval.isHighRisk) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f)
+                )
+                if (canExpand) {
+                    Text(
+                        text = if (isDetailsExpanded) "Свернуть ▲" else "Развернуть ▼",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier
+                            .clickable { isDetailsExpanded = !isDetailsExpanded }
+                            .padding(start = 8.dp)
+                    )
+                }
+            }
             Spacer(modifier = Modifier.height(2.dp))
             Text(
                 text = "Подтвердите: ${approval.title}",
@@ -1591,31 +1978,47 @@ fun ToolApprovalCard(
                 shape = RoundedCornerShape(8.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(
-                    text = approval.targetDisplay,
-                    style = MaterialTheme.typography.bodySmall.copy(
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.5.sp
-                    ),
-                    modifier = Modifier.padding(8.dp),
-                    maxLines = 4,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                )
+                SelectionContainer {
+                    Text(
+                        text = approval.targetDisplay,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.5.sp
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (isDetailsExpanded) Modifier.heightIn(max = 180.dp).verticalScroll(targetScrollState)
+                                else Modifier
+                            )
+                            .padding(8.dp),
+                        maxLines = if (isDetailsExpanded) Int.MAX_VALUE else 4,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                }
             }
 
             if (approval.detailPreview.isNotBlank()) {
                 Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    text = approval.detailPreview,
-                    style = MaterialTheme.typography.bodySmall.copy(
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                        lineHeight = 15.sp
-                    ),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 5,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                )
+                SelectionContainer {
+                    Text(
+                        text = approval.detailPreview,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp
+                        ),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (isDetailsExpanded) Modifier.heightIn(max = 220.dp).verticalScroll(detailScrollState)
+                                else Modifier
+                            ),
+                        maxLines = if (isDetailsExpanded) Int.MAX_VALUE else 5,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(10.dp))

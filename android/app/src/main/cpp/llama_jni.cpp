@@ -288,9 +288,15 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeLoadModel(
         return utf8_to_jstring(env, err);
     }
 
-    // 3. Создание контекста с адаптивным размером
-    int target_ctx = n_ctx > 0 ? n_ctx : 2048;
-    int ctx_attempts[] = { target_ctx, 1024, 512 };
+    // 3. Создание контекста с адаптивным размером (4096 -> 2048 -> 1024 -> 512)
+    int target_ctx = n_ctx > 0 ? n_ctx : 4096;
+    std::vector<int> ctx_attempts;
+    ctx_attempts.push_back(target_ctx);
+    for (int fallback_ctx : { 2048, 1024, 512 }) {
+        if (fallback_ctx < target_ctx) {
+            ctx_attempts.push_back(fallback_ctx);
+        }
+    }
 
     for (int ctx_size : ctx_attempts) {
         llama_context_params ctx_params = llama_context_default_params();
@@ -385,10 +391,9 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatPrompt(
                     templated.insert(user_chatml, "<|im_start|>system\n" + sys_str + "<|im_end|>\n");
                 } else if (user_deepseek != std::string::npos) {
                     size_t insert_pos = user_deepseek + strlen("<｜User｜>");
-                    std::string concise_inst = "[Отвечай только на русском языке]\n";
-                    templated.insert(insert_pos, concise_inst);
+                    templated.insert(insert_pos, sys_str + "\n\n");
                 } else {
-                    templated = "[Отвечай на русском языке]\n\n" + templated;
+                    templated = sys_str + "\n\n" + templated;
                 }
             }
 
@@ -463,10 +468,9 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeFormatChat(
                         templated.insert(user_chatml, "<|im_start|>system\n" + sys_content + "<|im_end|>\n");
                     } else if (user_deepseek != std::string::npos) {
                         size_t insert_pos = user_deepseek + strlen("<｜User｜>");
-                        std::string concise_inst = "[Отвечай только на русском языке]\n";
-                        templated.insert(insert_pos, concise_inst);
+                        templated.insert(insert_pos, sys_content + "\n\n");
                     } else {
-                        templated = "[Отвечай на русском языке]\n\n" + templated;
+                        templated = sys_content + "\n\n" + templated;
                     }
                 }
 

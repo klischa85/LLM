@@ -14,6 +14,7 @@ import com.klischa.llmnotes.api.LLMProviderType
 import com.klischa.llmnotes.api.OpenCodeClient
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,6 +24,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 enum class MessageRole {
     USER,
@@ -142,9 +144,13 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile
     private var pendingApprovalDeferred: CompletableDeferred<Boolean>? = null
 
+    private val generationEpoch = AtomicLong(0L)
+    private var generationJob: Job? = null
+
     companion object {
         private const val TAG = "LLMViewModel"
-        private const val MAX_AGENT_STEPS = 8
+        private const val MAX_AGENT_STEPS = 20
+        private const val MAX_CONSECUTIVE_RECOVERIES = 2
         private const val PREFS_NAME = "llm_app_prefs"
         private const val PREF_LAST_MODEL_PATH = "last_model_path"
         private const val PREF_LAST_MODEL_URI = "last_model_uri"
@@ -579,6 +585,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        generationEpoch.incrementAndGet()
+        generationJob?.cancel()
+        generationJob = null
         isRemoteCancelled = true
         isLocalCancelled = true
         pendingApprovalDeferred?.complete(false)
@@ -721,7 +730,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
                     val error = LlamaBridge.nativeLoadModel(
                         pathToUse,
-                        2048,
+                        4096,
                         _uiState.value.threadCount
                     )
 
@@ -847,7 +856,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
         val error = LlamaBridge.nativeLoadModel(
             path,
-            2048,
+            4096,
             _uiState.value.threadCount
         )
 
@@ -989,13 +998,19 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
         isRemoteCancelled = false
         isLocalCancelled = false
+        val myEpoch = generationEpoch.incrementAndGet()
+        fun isActiveEpoch(): Boolean = generationEpoch.get() == myEpoch
 
         // Вся работа с БД, файлами, телеметрией, Termux и сетью/инференсом — в фоновом потоке
-        viewModelScope.launch(Dispatchers.IO) {
+        generationJob = viewModelScope.launch(Dispatchers.IO) {
+            if (!isActiveEpoch()) return@launch
+
             val currentChatId = existingChatId.ifBlank {
                 val newId = UUID.randomUUID().toString()
                 dbHelper.createSession(newId, "Новый чат")
-                _uiState.update { it.copy(currentChatId = newId) }
+                if (isActiveEpoch()) {
+                    _uiState.update { it.copy(currentChatId = newId) }
+                }
                 newId
             }
 
@@ -1009,11 +1024,13 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 val newTitle = titleSeed.take(30) + if (titleSeed.length > 30) "..." else ""
                 dbHelper.updateSessionTitle(currentChatId, newTitle)
                 val updatedSessions = dbHelper.getAllSessions()
-                _uiState.update { it.copy(chatSessions = updatedSessions) }
+                if (isActiveEpoch()) {
+                    _uiState.update { it.copy(chatSessions = updatedSessions) }
+                }
             }
 
-            // Собираем историю диалога (последние 10 сообщений)
-            val historyForPrompt = previousMessages.takeLast(10)
+            // Собираем историю диалога (последние 10 сообщений; для локального GGUF — 6 для экономии контекста)
+            val historyForPrompt = previousMessages.takeLast(if (isLocal) 6 else 10)
             val rolesList = mutableListOf<String>()
             val contentsList = mutableListOf<String>()
 
@@ -1031,7 +1048,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
             val agentPrompt = if (agentEnabled) {
                 val tStatus = TermuxBridge.checkStatus(getApplication())
-                _uiState.update { it.copy(termuxStatus = tStatus) }
+                if (isActiveEpoch()) {
+                    _uiState.update { it.copy(termuxStatus = tStatus) }
+                }
                 AgentTools.buildAgentSystemPrompt(tStatus)
             } else {
                 ""
@@ -1046,14 +1065,14 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 contentsList.add(effectiveSysPrompt)
             }
 
-            // 2. История предыдущих реплик (очищаем <think> и <agent_steps> для экономии контекста и совместимости с DeepSeek R1)
+            // 2. История предыдущих реплик (очищаем <think> и <agent_steps*> для экономии контекста и совместимости с DeepSeek R1 / Qwen3)
             for (msg in historyForPrompt) {
                 if (msg.role == MessageRole.USER) {
                     rolesList.add("user")
                     contentsList.add(msg.text)
                 } else if (msg.role == MessageRole.ASSISTANT && msg.text.isNotBlank()) {
                     val parsed = ThoughtParser.parse(msg.text, isStreaming = false)
-                    val cleanText = parsed.answerText.ifBlank { ThoughtParser.cleanStopTokens(msg.text) }.trim()
+                    val cleanText = parsed.answerText.trim()
                     if (cleanText.isNotBlank()) {
                         rolesList.add("assistant")
                         contentsList.add(cleanText)
@@ -1085,12 +1104,13 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             contentsList.add(finalUserPromptForModel)
 
             val maxSteps = if (agentEnabled) MAX_AGENT_STEPS else 1
-            val agentLogLines = mutableListOf<String>()
+            val agentSteps = mutableListOf<AgentStepLog>()
             val startTime = System.currentTimeMillis()
             var totalTokens = 0
             var finalStepText = ""
+            var accumulatedAnswerParts = StringBuilder()
 
-            // Ветка 1: Внешний облачный API (DeepSeek / OpenRouter / Groq / OpenCode ZEN / GO) с многошаговым агентным циклом
+            // Ветка 1: Внешний облачный API (DeepSeek / OpenRouter / Groq / OpenCode ZEN / GO) с многошаговым самовосстанавливающимся агентным циклом
             if (!isLocal) {
                 val apiMessages = ArrayList<ApiChatMessage>(rolesList.size)
                 for (i in 0 until rolesList.size) {
@@ -1104,13 +1124,19 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
 
+                var consecutiveRecoveries = 0
+                var lengthContinuationUsed = false
+
                 try {
                     for (step in 1..maxSteps) {
-                        if (isRemoteCancelled) break
+                        if (isRemoteCancelled || !isActiveEpoch()) break
                         val stepBuilder = StringBuilder()
-                        val stepsPrefix = buildStepsPrefix(agentLogLines)
+                        val stepsPrefix = buildStepsPrefix(agentSteps)
+                        val priorContinuationPrefix = if (accumulatedAnswerParts.isNotEmpty()) {
+                            accumulatedAnswerParts.toString() + "\n"
+                        } else ""
 
-                        OpenCodeClient.streamChatCompletions(
+                        val streamRes = OpenCodeClient.streamChatCompletions(
                             provider = activeProvider,
                             apiKey = activeApiKey,
                             model = activeRemoteModel,
@@ -1118,69 +1144,191 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                             conversationId = currentChatId,
                             temperature = activeTemperature,
                             onToken = { tokenPiece ->
-                                totalTokens++
-                                stepBuilder.append(tokenPiece)
-                                val currentStepClean = ThoughtParser.cleanStopTokens(stepBuilder.toString())
-                                val liveDisplay = stepsPrefix + currentStepClean
-                                val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
-                                val speed = if (elapsedSec > 0.05f) totalTokens / elapsedSec else 0.0f
+                                if (!isRemoteCancelled && isActiveEpoch()) {
+                                    totalTokens++
+                                    stepBuilder.append(tokenPiece)
+                                    val currentStepClean = ThoughtParser.cleanStopTokens(stepBuilder.toString())
+                                    val liveDisplay = stepsPrefix + priorContinuationPrefix + currentStepClean
+                                    val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
+                                    val speed = if (elapsedSec > 0.05f) totalTokens / elapsedSec else 0.0f
 
-                                _uiState.update { current ->
-                                    val msgs = current.messages.map { m ->
-                                        if (m.id == assistantMsgId) {
-                                            m.copy(text = liveDisplay, tokensPerSec = speed, isStreaming = true)
-                                        } else {
-                                            m
+                                    _uiState.update { current ->
+                                        val msgs = current.messages.map { m ->
+                                            if (m.id == assistantMsgId) {
+                                                m.copy(text = liveDisplay, tokensPerSec = speed, isStreaming = true)
+                                            } else {
+                                                m
+                                            }
                                         }
+                                        current.copy(
+                                            messages = msgs,
+                                            totalTokensGenerated = totalTokens,
+                                            tokensPerSecond = speed,
+                                            generationTimeSeconds = elapsedSec
+                                        )
                                     }
-                                    current.copy(
-                                        messages = msgs,
-                                        totalTokensGenerated = totalTokens,
-                                        tokensPerSecond = speed,
-                                        generationTimeSeconds = elapsedSec
-                                    )
                                 }
                             },
-                            isCancelled = { isRemoteCancelled }
+                            isCancelled = { isRemoteCancelled || !isActiveEpoch() }
                         )
 
+                        if (!isActiveEpoch()) return@launch
                         val stepRaw = ThoughtParser.cleanStopTokens(stepBuilder.toString())
-                        finalStepText = stepRaw
-
-                        val toolCalls = if (agentEnabled && !isRemoteCancelled) {
-                            AgentTools.extractToolCalls(stepRaw)
+                        finalStepText = if (priorContinuationPrefix.isNotEmpty()) {
+                            priorContinuationPrefix + stepRaw
                         } else {
-                            emptyList()
+                            stepRaw
                         }
 
-                        if (toolCalls.isEmpty() || step == maxSteps) {
-                            break
+                        val extraction = if (agentEnabled && !isRemoteCancelled) {
+                            AgentTools.extractToolCallsDetailed(stepRaw)
+                        } else {
+                            ToolCallExtraction(emptyList())
+                        }
+                        val toolCalls = when {
+                            extraction.calls.isNotEmpty() -> extraction.calls
+                            agentEnabled && !isRemoteCancelled && streamRes.nativeToolCalls.isNotEmpty() -> streamRes.nativeToolCalls
+                            else -> emptyList()
                         }
 
-                        // Выполняем запрошенные агентом инструменты (с подтверждением опасных действий!)
-                        val observation = executeAgentToolCalls(
-                            calls = toolCalls,
-                            confirmMode = activeConfirmMode,
-                            agentLogLines = agentLogLines,
-                            assistantMsgId = assistantMsgId,
-                            isCancelled = { isRemoteCancelled }
-                        )
-                        if (isRemoteCancelled) break
+                        if (toolCalls.isNotEmpty()) {
+                            consecutiveRecoveries = 0
+                            accumulatedAnswerParts = StringBuilder()
 
-                        apiMessages.add(ApiChatMessage("assistant", stepRaw))
-                        apiMessages.add(
-                            ApiChatMessage(
-                                "user",
-                                "$observation\n\nПродолжи выполнение задачи или дай итоговый ответ пользователю на русском языке."
-                            )
-                        )
-                        _uiState.update { it.copy(statusMessage = "Агент анализирует результат (шаг ${step + 1})...") }
+                            if (step < maxSteps) {
+                                // Выполняем запрошенные агентом инструменты (с подтверждением опасных действий!)
+                                val observation = executeAgentToolCalls(
+                                    calls = toolCalls,
+                                    confirmMode = activeConfirmMode,
+                                    agentSteps = agentSteps,
+                                    assistantMsgId = assistantMsgId,
+                                    isCancelled = { isRemoteCancelled || !isActiveEpoch() }
+                                )
+                                if (isRemoteCancelled || !isActiveEpoch()) break
+
+                                // ВАЖНО: Передаём в историю ЧИСТЫЙ assistant-ход БЕЗ <think>...</think>,
+                                // иначе DeepSeek-R1 / Qwen3 обрывают рассуждение с </think> или </tool_call>!
+                                apiMessages.add(
+                                    ApiChatMessage(
+                                        "assistant",
+                                        AgentTools.buildAssistantTurnForHistory(stepRaw, toolCalls)
+                                    )
+                                )
+                                apiMessages.add(
+                                    ApiChatMessage(
+                                        "user",
+                                        "$observation\n\nПроанализируй результат и продолжи выполнение задачи (вызови следующий инструмент через <tool_call>, если нужно) или дай итоговый ответ пользователю на русском языке."
+                                    )
+                                )
+                                _uiState.update { it.copy(statusMessage = "Агент анализирует результат (шаг ${step + 1})...") }
+                                continue
+                            } else {
+                                // Достигнут лимит шагов — просим модель подвести аккуратный итог вместо резкого обрыва
+                                apiMessages.add(
+                                    ApiChatMessage(
+                                        "assistant",
+                                        AgentTools.buildAssistantTurnForHistory(stepRaw, toolCalls)
+                                    )
+                                )
+                                apiMessages.add(
+                                    ApiChatMessage(
+                                        "user",
+                                        "Достигнут лимит шагов агента ($maxSteps). Не вызывай больше инструменты — кратко подведи итог выполненных действий и укажи, что осталось сделать, на русском языке."
+                                    )
+                                )
+                                _uiState.update { it.copy(statusMessage = "Агент формирует итог...") }
+                                val summaryBuilder = StringBuilder()
+                                val finalStepsPrefix = buildStepsPrefix(agentSteps)
+                                OpenCodeClient.streamChatCompletions(
+                                    provider = activeProvider,
+                                    apiKey = activeApiKey,
+                                    model = activeRemoteModel,
+                                    messages = apiMessages,
+                                    conversationId = currentChatId,
+                                    temperature = activeTemperature,
+                                    onToken = { piece ->
+                                        if (!isRemoteCancelled && isActiveEpoch()) {
+                                            totalTokens++
+                                            summaryBuilder.append(piece)
+                                            val liveDisplay = finalStepsPrefix + ThoughtParser.cleanStopTokens(summaryBuilder.toString())
+                                            val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
+                                            val speed = if (elapsedSec > 0.05f) totalTokens / elapsedSec else 0.0f
+                                            _uiState.update { current ->
+                                                val msgs = current.messages.map { m ->
+                                                    if (m.id == assistantMsgId) m.copy(text = liveDisplay, tokensPerSec = speed, isStreaming = true) else m
+                                                }
+                                                current.copy(messages = msgs, totalTokensGenerated = totalTokens, tokensPerSecond = speed, generationTimeSeconds = elapsedSec)
+                                            }
+                                        }
+                                    },
+                                    isCancelled = { isRemoteCancelled || !isActiveEpoch() }
+                                )
+                                finalStepText = ThoughtParser.cleanStopTokens(summaryBuilder.toString())
+                                break
+                            }
+                        }
+
+                        // Инструменты не извлечены — проверяем, не произошла ли ложная остановка
+                        // (битый <tool_call>, висячий </tool_call>, пустой ответ после </think> или обрыв по length)
+                        if (agentEnabled && !isRemoteCancelled && step < maxSteps) {
+                            val parsedStep = ThoughtParser.parse(stepRaw, isStreaming = false)
+
+                            if (extraction.hadMalformedAttempt && consecutiveRecoveries < MAX_CONSECUTIVE_RECOVERIES) {
+                                consecutiveRecoveries++
+                                val cleanNote = parsedStep.answerText.take(400).ifBlank { "(некорректный вызов инструмента)" }
+                                apiMessages.add(ApiChatMessage("assistant", cleanNote))
+                                apiMessages.add(
+                                    ApiChatMessage(
+                                        "user",
+                                        "Ошибка разбора <tool_call>: ${extraction.malformedReason ?: "некорректный JSON"}. " +
+                                        "Повтори вызов инструмента в строго валидном JSON внутри <tool_call>{\"tool\": \"имя\", \"args\": {...}}</tool_call> " +
+                                        "(экранируй переносы строк как \\n и кавычки как \\\"). Не пиши лишних тегов."
+                                    )
+                                )
+                                _uiState.update { it.copy(statusMessage = "Агент исправляет формат команды (попытка $consecutiveRecoveries)...") }
+                                continue
+                            }
+
+                            if (parsedStep.answerText.isBlank() && consecutiveRecoveries < MAX_CONSECUTIVE_RECOVERIES) {
+                                consecutiveRecoveries++
+                                val nudge = if (streamRes.finishReason == "length") {
+                                    "Твои рассуждения оборвались по лимиту длины ответа. Сразу вызови нужный инструмент через <tool_call> или кратко ответь пользователю на русском языке."
+                                } else {
+                                    "Ты завершил рассуждение, но не вызвал инструмент и не написал ответ пользователю. " +
+                                    "Если нужно выполнить действие — выведи валидный блок <tool_call>{\"tool\": \"...\", \"args\": {...}}</tool_call>, " +
+                                    "иначе дай понятный итоговый ответ пользователю на русском языке."
+                                }
+                                // Соблюдаем строгое чередование user -> assistant -> user (важно для DeepSeek R1 / Anthropic / Qwen)
+                                apiMessages.add(ApiChatMessage("assistant", "(рассуждение завершено)"))
+                                apiMessages.add(ApiChatMessage("user", nudge))
+                                _uiState.update { it.copy(statusMessage = "Агент продолжает работу после рассуждения...") }
+                                continue
+                            }
+
+                            if (streamRes.finishReason == "length" && parsedStep.answerText.isNotBlank() && !lengthContinuationUsed) {
+                                lengthContinuationUsed = true
+                                accumulatedAnswerParts.append(parsedStep.answerText)
+                                apiMessages.add(ApiChatMessage("assistant", parsedStep.answerText))
+                                apiMessages.add(
+                                    ApiChatMessage(
+                                        "user",
+                                        "Твой ответ оборвался из-за лимита длины. Продолжи строго с того места, где остановился, не повторяя уже написанное."
+                                    )
+                                )
+                                _uiState.update { it.copy(statusMessage = "Агент продолжает обрезанный ответ...") }
+                                continue
+                            }
+                        }
+
+                        break
                     }
+
+                    if (!isActiveEpoch()) return@launch
 
                     val totalElapsed = (System.currentTimeMillis() - startTime) / 1000f
                     val finalSpeed = if (totalElapsed > 0.05f) totalTokens / totalElapsed else 0.0f
                     val cleanFinalBody = AgentTools.stripToolCallBlocks(finalStepText)
-                    val finalText = buildStepsPrefix(agentLogLines) + cleanFinalBody
+                    val finalText = buildStepsPrefix(agentSteps) + cleanFinalBody
                     val wasCancelled = isRemoteCancelled
 
                     val completedMsg = ChatMessage(
@@ -1194,7 +1342,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     val refreshedSessions = dbHelper.getAllSessions()
 
                     val fileNote = if (loadedLocalFiles.isNotEmpty()) " (файлы: ${loadedLocalFiles.joinToString()})" else ""
-                    val stepsNote = if (agentLogLines.isNotEmpty()) " • действий: ${agentLogLines.size}" else ""
+                    val stepsNote = if (agentSteps.isNotEmpty()) " • действий: ${agentSteps.size}" else ""
                     val doneStatus = if (wasCancelled) {
                         "Генерация остановлена пользователем"
                     } else {
@@ -1217,7 +1365,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
 
-                    // Обновляем виджет на рабочем столе (передаем чистый ответ без <think> и <agent_steps>)
+                    // Обновляем виджет на рабочем столе (передаем чистый ответ без <think> и <agent_steps_json>)
                     val widgetAnswer = ThoughtParser.parse(finalText, isStreaming = false).answerText.ifBlank { finalText }
                     if (widgetAnswer.isNotBlank()) {
                         LLMWidgetProvider.updateAllWidgets(
@@ -1228,8 +1376,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 } catch (e: Exception) {
+                    if (!isActiveEpoch()) return@launch
                     Log.e(TAG, "Ошибка генерации через ${activeProvider.displayName}: ${e.message}")
-                    val errText = buildStepsPrefix(agentLogLines) +
+                    val errText = buildStepsPrefix(agentSteps) +
                         "⚠️ Ошибка API (${activeProvider.displayName}): ${e.message ?: "Сбой соединения"}"
                     val errorMsg = ChatMessage(
                         id = assistantMsgId,
@@ -1254,90 +1403,127 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            // Ветка 2: Локальная модель GGUF (также поддерживает агентные инструменты!)
+            // Ветка 2: Локальная модель GGUF (также с самовосстановлением агентного цикла!)
+            var localConsecutiveRecoveries = 0
             for (step in 1..maxSteps) {
-                if (isLocalCancelled) break
+                if (isLocalCancelled || !isActiveEpoch()) break
                 val formattedPrompt = LlamaBridge.nativeFormatChat(
                     rolesList.toTypedArray(),
                     contentsList.toTypedArray()
                 )
                 val stepBuilder = StringBuilder()
-                val stepsPrefix = buildStepsPrefix(agentLogLines)
+                val stepsPrefix = buildStepsPrefix(agentSteps)
 
                 val callback = LlamaBridge.TokenCallback { tokenPiece ->
-                    totalTokens++
-                    stepBuilder.append(tokenPiece)
+                    if (!isLocalCancelled && isActiveEpoch()) {
+                        totalTokens++
+                        stepBuilder.append(tokenPiece)
 
-                    for (marker in ThoughtParser.STOP_MARKERS) {
-                        val idx = stepBuilder.indexOf(marker)
-                        if (idx != -1) {
-                            LlamaBridge.stopGeneration()
-                            stepBuilder.setLength(idx)
-                            break
-                        }
-                    }
-
-                    val currentStepClean = ThoughtParser.cleanStopTokens(stepBuilder.toString())
-                    val liveDisplay = stepsPrefix + currentStepClean
-                    val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
-                    val speed = if (elapsedSec > 0.05f) totalTokens / elapsedSec else 0.0f
-
-                    _uiState.update { current ->
-                        val msgs = current.messages.map { m ->
-                            if (m.id == assistantMsgId) {
-                                m.copy(text = liveDisplay, tokensPerSec = speed, isStreaming = true)
-                            } else {
-                                m
+                        for (marker in ThoughtParser.STOP_MARKERS) {
+                            val idx = stepBuilder.indexOf(marker)
+                            if (idx != -1) {
+                                LlamaBridge.stopGeneration()
+                                stepBuilder.setLength(idx)
+                                break
                             }
                         }
-                        current.copy(
-                            messages = msgs,
-                            totalTokensGenerated = totalTokens,
-                            tokensPerSecond = speed,
-                            generationTimeSeconds = elapsedSec
-                        )
+
+                        val currentStepClean = ThoughtParser.cleanStopTokens(stepBuilder.toString())
+                        val liveDisplay = stepsPrefix + currentStepClean
+                        val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
+                        val speed = if (elapsedSec > 0.05f) totalTokens / elapsedSec else 0.0f
+
+                        _uiState.update { current ->
+                            val msgs = current.messages.map { m ->
+                                if (m.id == assistantMsgId) {
+                                    m.copy(text = liveDisplay, tokensPerSec = speed, isStreaming = true)
+                                } else {
+                                    m
+                                }
+                            }
+                            current.copy(
+                                messages = msgs,
+                                totalTokensGenerated = totalTokens,
+                                tokensPerSecond = speed,
+                                generationTimeSeconds = elapsedSec
+                            )
+                        }
                     }
                 }
 
                 LlamaBridge.nativeGenerate(
                     formattedPrompt,
-                    1024,
+                    2048,
                     activeTemperature,
                     activeTopP,
                     callback
                 )
 
+                if (!isActiveEpoch()) return@launch
                 val stepRaw = ThoughtParser.cleanStopTokens(stepBuilder.toString())
                 finalStepText = stepRaw
 
-                val toolCalls = if (agentEnabled && !isLocalCancelled) {
-                    AgentTools.extractToolCalls(stepRaw)
+                val extraction = if (agentEnabled && !isLocalCancelled) {
+                    AgentTools.extractToolCallsDetailed(stepRaw)
                 } else {
-                    emptyList()
+                    ToolCallExtraction(emptyList())
                 }
-                if (toolCalls.isEmpty() || step == maxSteps) {
-                    break
+                val toolCalls = extraction.calls
+
+                if (toolCalls.isNotEmpty()) {
+                    localConsecutiveRecoveries = 0
+                    if (step == maxSteps) break
+
+                    val observation = executeAgentToolCalls(
+                        calls = toolCalls,
+                        confirmMode = activeConfirmMode,
+                        agentSteps = agentSteps,
+                        assistantMsgId = assistantMsgId,
+                        isCancelled = { isLocalCancelled || !isActiveEpoch() }
+                    )
+                    if (isLocalCancelled || !isActiveEpoch()) break
+
+                    rolesList.add("assistant")
+                    contentsList.add(AgentTools.buildAssistantTurnForHistory(stepRaw, toolCalls))
+                    rolesList.add("user")
+                    contentsList.add("${observation.take(4000)}\n\nПродолжи задачу или ответь пользователю на русском языке.")
+                    continue
                 }
 
-                val observation = executeAgentToolCalls(
-                    calls = toolCalls,
-                    confirmMode = activeConfirmMode,
-                    agentLogLines = agentLogLines,
-                    assistantMsgId = assistantMsgId,
-                    isCancelled = { isLocalCancelled }
-                )
-                if (isLocalCancelled) break
+                if (agentEnabled && !isLocalCancelled && step < maxSteps) {
+                    val parsedStep = ThoughtParser.parse(stepRaw, isStreaming = false)
+                    if (extraction.hadMalformedAttempt && localConsecutiveRecoveries < MAX_CONSECUTIVE_RECOVERIES) {
+                        localConsecutiveRecoveries++
+                        rolesList.add("assistant")
+                        contentsList.add(parsedStep.answerText.take(200).ifBlank { "(некорректный вызов инструмента)" })
+                        rolesList.add("user")
+                        contentsList.add(
+                            "Ошибка формата <tool_call> (${extraction.malformedReason ?: "некорректный JSON"}). " +
+                            "Повтори вызов инструмента в валидном JSON: <tool_call>{\"tool\": \"...\", \"args\": {...}}</tool_call>."
+                        )
+                        _uiState.update { it.copy(statusMessage = "Агент исправляет формат команды...") }
+                        continue
+                    }
+                    if (parsedStep.answerText.isBlank() && localConsecutiveRecoveries < MAX_CONSECUTIVE_RECOVERIES) {
+                        localConsecutiveRecoveries++
+                        rolesList.add("assistant")
+                        contentsList.add("(рассуждение завершено)")
+                        rolesList.add("user")
+                        contentsList.add("Дай итоговый ответ пользователю на русском языке или вызови инструмент через <tool_call>.")
+                        _uiState.update { it.copy(statusMessage = "Агент продолжает после рассуждения...") }
+                        continue
+                    }
+                }
 
-                rolesList.add("assistant")
-                contentsList.add(stepRaw)
-                rolesList.add("user")
-                contentsList.add("$observation\n\nПродолжи задачу или ответь пользователю на русском языке.")
+                break
             }
+
+            if (!isActiveEpoch()) return@launch
 
             val totalElapsed = (System.currentTimeMillis() - startTime) / 1000f
             val finalSpeed = if (totalElapsed > 0.05f) totalTokens / totalElapsed else 0.0f
             val cleanFinalBody = AgentTools.stripToolCallBlocks(finalStepText)
-            val finalText = buildStepsPrefix(agentLogLines) + cleanFinalBody
+            val finalText = buildStepsPrefix(agentSteps) + cleanFinalBody
             val wasCancelled = isLocalCancelled
 
             val completedMsg = ChatMessage(
@@ -1351,7 +1537,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             val refreshedSessions = dbHelper.getAllSessions()
 
             val fileNote = if (loadedLocalFiles.isNotEmpty()) " (файлы: ${loadedLocalFiles.joinToString()})" else ""
-            val stepsNote = if (agentLogLines.isNotEmpty()) " • действий: ${agentLogLines.size}" else ""
+            val stepsNote = if (agentSteps.isNotEmpty()) " • действий: ${agentSteps.size}" else ""
             val doneStatus = if (wasCancelled) {
                 "Генерация остановлена пользователем"
             } else {
@@ -1387,15 +1573,14 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun buildStepsPrefix(agentLogLines: List<String>): String {
-        if (agentLogLines.isEmpty()) return ""
-        return "<agent_steps>\n${agentLogLines.joinToString("\n")}\n</agent_steps>\n\n"
+    private fun buildStepsPrefix(agentSteps: List<AgentStepLog>): String {
+        return ThoughtParser.encodeAgentSteps(agentSteps)
     }
 
     private suspend fun executeAgentToolCalls(
         calls: List<AgentToolCall>,
         confirmMode: AgentConfirmationMode,
-        agentLogLines: MutableList<String>,
+        agentSteps: MutableList<AgentStepLog>,
         assistantMsgId: String,
         isCancelled: () -> Boolean
     ): String {
@@ -1403,6 +1588,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
         for (call in calls) {
             if (isCancelled()) break
+
+            val argsDisplay = AgentTools.formatArgsForDisplay(call).take(2000)
 
             if (AgentTools.needsConfirmation(call, confirmMode)) {
                 val approval = AgentTools.buildApprovalPrompt(call)
@@ -1422,8 +1609,18 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
                 if (!approved || isCancelled()) {
                     val shortTarget = approval.targetDisplay.lineSequence().firstOrNull()?.take(56) ?: ""
-                    agentLogLines.add("⛔ Отклонено: ${approval.title} ($shortTarget)")
-                    updateAssistantStepsPreview(assistantMsgId, agentLogLines)
+                    agentSteps.add(
+                        AgentStepLog(
+                            index = agentSteps.size + 1,
+                            tool = call.tool,
+                            status = "denied",
+                            summary = "Отклонено: ${approval.title} ($shortTarget)",
+                            argsPreview = argsDisplay,
+                            output = "Операция отклонена пользователем.",
+                            durationMs = 0L
+                        )
+                    )
+                    updateAssistantStepsPreview(assistantMsgId, agentSteps)
                     observations.append("<tool_result tool=\"${call.tool}\" status=\"denied\">\n")
                     observations.append("[Отклонено пользователем] Пользователь запретил выполнять операцию '${approval.title}' для '$shortTarget'.")
                     observations.append("\n</tool_result>\n")
@@ -1438,10 +1635,22 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
 
+            val t0 = System.currentTimeMillis()
             val res = AgentTools.execute(getApplication(), call)
-            val icon = if (res.ok) "✅" else "❌"
-            agentLogLines.add("$icon ${res.summary}")
-            updateAssistantStepsPreview(assistantMsgId, agentLogLines)
+            val elapsedMs = System.currentTimeMillis() - t0
+
+            agentSteps.add(
+                AgentStepLog(
+                    index = agentSteps.size + 1,
+                    tool = call.tool,
+                    status = if (res.ok) "ok" else "error",
+                    summary = res.summary,
+                    argsPreview = argsDisplay,
+                    output = res.output.take(4000),
+                    durationMs = elapsedMs
+                )
+            )
+            updateAssistantStepsPreview(assistantMsgId, agentSteps)
 
             observations.append("<tool_result tool=\"${call.tool}\" status=\"${if (res.ok) "ok" else "error"}\">\n")
             observations.append(res.output)
@@ -1452,14 +1661,73 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         return observations.toString().trim()
     }
 
-    private fun updateAssistantStepsPreview(assistantMsgId: String, agentLogLines: List<String>) {
-        val prefix = buildStepsPrefix(agentLogLines)
+    private fun updateAssistantStepsPreview(assistantMsgId: String, agentSteps: List<AgentStepLog>) {
+        val prefix = buildStepsPrefix(agentSteps)
         _uiState.update { current ->
             val msgs = current.messages.map { m ->
                 if (m.id == assistantMsgId) m.copy(text = prefix, isStreaming = true) else m
             }
             current.copy(messages = msgs)
         }
+    }
+
+    /**
+     * Отменяет ранее отправленное сообщение пользователя и откатывает историю чата
+     * (как в UI, так и в SQLite) к моменту строго ДО этого сообщения.
+     */
+    fun rollbackToMessage(messageId: String, restoreToInput: Boolean = true) {
+        val state = _uiState.value
+        val targetIndex = state.messages.indexOfFirst { it.id == messageId && it.role == MessageRole.USER }
+        if (targetIndex == -1) return
+
+        // Мгновенно прерываем любую текущую генерацию, ожидание подтверждения и фоновые команды Termux
+        generationEpoch.incrementAndGet()
+        generationJob?.cancel()
+        generationJob = null
+        isRemoteCancelled = true
+        isLocalCancelled = true
+        LlamaBridge.nativeStop()
+        pendingApprovalDeferred?.complete(false)
+        pendingApprovalDeferred = null
+        TermuxBridge.cancelAllPending()
+
+        val targetMsg = state.messages[targetIndex]
+        val removedCount = state.messages.size - targetIndex
+        val remaining = state.messages.subList(0, targetIndex)
+        val chatId = state.currentChatId
+        val restoredPrompt = if (restoreToInput) extractCleanUserPrompt(targetMsg.text) else state.inputText
+
+        if (chatId.isNotBlank()) {
+            dbHelper.replaceChatMessages(chatId, remaining)
+            if (remaining.isEmpty()) {
+                dbHelper.updateSessionTitle(chatId, "Новый чат")
+            }
+        }
+        val refreshedSessions = dbHelper.getAllSessions()
+
+        _uiState.update { current ->
+            current.copy(
+                messages = remaining,
+                chatSessions = refreshedSessions,
+                inputText = restoredPrompt,
+                isGenerating = false,
+                pendingToolApproval = null,
+                activeToolStatus = null,
+                statusMessage = "↩️ Чат откачен (удалено сообщений: $removedCount)"
+            )
+        }
+    }
+
+    private fun extractCleanUserPrompt(displayText: String): String {
+        val lines = displayText.lines()
+        if (lines.size >= 2) {
+            val firstLine = lines.first()
+            val startsWithAttachmentEmoji = AttachmentCategory.values().any { firstLine.startsWith("${it.emoji} ") }
+            if (startsWithAttachmentEmoji) {
+                return lines.drop(1).joinToString("\n").trim()
+            }
+        }
+        return displayText.trim()
     }
 
     fun clearChat() {
@@ -1515,6 +1783,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopGeneration() {
+        generationEpoch.incrementAndGet()
+        generationJob?.cancel()
+        generationJob = null
         if (_uiState.value.providerType == LLMProviderType.LOCAL_GGUF) {
             isLocalCancelled = true
             LlamaBridge.nativeStop()

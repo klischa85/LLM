@@ -197,4 +197,37 @@ class ChatDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_
         }
         db.update(TABLE_CHATS, updateValues, "$COL_CHAT_ID = ?", arrayOf(chatId))
     }
+
+    /**
+     * Атомарно заменяет сообщения указанного диалога (используется при откате чата до выбранного сообщения).
+     */
+    fun replaceChatMessages(chatId: String, remainingMessages: List<ChatMessage>) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.delete(TABLE_MESSAGES, "$COL_MSG_CHAT_ID = ?", arrayOf(chatId))
+            for (message in remainingMessages) {
+                val values = ContentValues().apply {
+                    put(COL_MSG_ID, message.id)
+                    put(COL_MSG_CHAT_ID, chatId)
+                    put(COL_MSG_ROLE, message.role.name)
+                    put(COL_MSG_TEXT, message.text)
+                    put(COL_MSG_TIME, message.timestamp)
+                    if (message.tokensPerSec != null) {
+                        put(COL_MSG_TPS, message.tokensPerSec)
+                    } else {
+                        putNull(COL_MSG_TPS)
+                    }
+                }
+                db.insertWithOnConflict(TABLE_MESSAGES, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+            val updateValues = ContentValues().apply {
+                put(COL_CHAT_UPDATED, System.currentTimeMillis())
+            }
+            db.update(TABLE_CHATS, updateValues, "$COL_CHAT_ID = ?", arrayOf(chatId))
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
 }

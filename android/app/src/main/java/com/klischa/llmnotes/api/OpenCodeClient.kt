@@ -1,11 +1,13 @@
 package com.klischa.llmnotes.api
 
 import android.util.Log
+import com.klischa.llmnotes.AgentToolCall
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.URL
+import java.util.Locale
 import javax.net.ssl.HttpsURLConnection
 
 /**
@@ -32,13 +34,20 @@ data class ApiChatMessage(
     val imageDataUrls: List<String> = emptyList()
 )
 
+data class StreamCompletionResult(
+    val finishReason: String? = null,
+    val nativeToolCalls: List<AgentToolCall> = emptyList(),
+    val receivedContentChars: Int = 0,
+    val receivedReasoningChars: Int = 0
+)
+
 /**
  * Клиент взаимодействия с внешними OpenAI-совместимыми API:
  * DeepSeek API, OpenRouter, Groq Cloud, OpenCode ZEN, OpenCode GO.
  */
 object OpenCodeClient {
     private const val TAG = "OpenCodeClient"
-    private const val APP_USER_AGENT = "LLM-Android/1.3.7"
+    private const val APP_USER_AGENT = "LLM-Android/1.3.8"
     const val OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
 
     init {
@@ -281,12 +290,12 @@ object OpenCodeClient {
         temperature: Float = 0.7f,
         onToken: (String) -> Unit,
         isCancelled: () -> Boolean
-    ) {
+    ): StreamCompletionResult {
         val hasImages = messages.any { it.imageDataUrls.isNotEmpty() }
         // Официальный DeepSeek API (/v1/chat/completions) является текстовым — отправляем без image_url
         val allowVision = hasImages && provider != LLMProviderType.DEEPSEEK
 
-        try {
+        return try {
             executeStreamRequest(
                 provider = provider,
                 apiKey = apiKey,
@@ -324,7 +333,7 @@ object OpenCodeClient {
         includeImages: Boolean,
         onToken: (String) -> Unit,
         isCancelled: () -> Boolean
-    ) {
+    ): StreamCompletionResult {
         val endpoint = "${provider.baseUrl}/chat/completions"
         var conn: HttpsURLConnection? = null
         try {
@@ -371,8 +380,8 @@ object OpenCodeClient {
 
             conn.doOutput = true
             conn.connectTimeout = 20000
-            // DeepSeek Reasoner (R1) или мультимодальные запросы с изображениями могут думать дольше
-            conn.readTimeout = if (isDeepSeekReasoner || includeImages) 120000 else 60000
+            // Модели с рассуждениями (DeepSeek R1, Qwen3, QwQ) и агентные шаги могут думать длительно
+            conn.readTimeout = 120000
 
             val rootJson = JSONObject().apply {
                 put("model", model)
@@ -471,9 +480,17 @@ object OpenCodeClient {
                 throw Exception("Ошибка ${provider.displayName} ($responseCode): $tip")
             }
 
+            var finishReason: String? = null
+            var receivedContentChars = 0
+            var receivedReasoningChars = 0
+            val nativeToolNames = linkedMapOf<Int, StringBuilder>()
+            val nativeToolArgs = linkedMapOf<Int, StringBuilder>()
+            var streamErrorMessage: String? = null
+
             BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { reader ->
                 var line: String?
                 var isThinking = false
+                var hasStartedContent = false
                 while (reader.readLine().also { line = it } != null) {
                     if (isCancelled()) break
                     val l = line?.trim() ?: continue
@@ -482,44 +499,106 @@ object OpenCodeClient {
                     if (l.startsWith("data:")) {
                         val payload = l.removePrefix("data:").trim()
                         if (payload == "[DONE]") break
-                        try {
-                            val chunkJson = JSONObject(payload)
-                            val choices = chunkJson.optJSONArray("choices")
-                            if (choices != null && choices.length() > 0) {
-                                val delta = choices.getJSONObject(0).optJSONObject("delta")
-                                val content = if (delta != null && !delta.isNull("content")) {
-                                    val s = delta.optString("content", "")
+                        val chunkJson = try {
+                            JSONObject(payload)
+                        } catch (_: Exception) {
+                            continue
+                        }
+
+                        // Проверяем, не прислал ли сервер ошибку прямо внутри SSE-потока (часто у OpenRouter/OpenCode)
+                        if (chunkJson.has("error") && !chunkJson.isNull("error")) {
+                            val errObj = chunkJson.optJSONObject("error")
+                            streamErrorMessage = errObj?.optString("message")
+                                ?.takeIf { it.isNotBlank() }
+                                ?: chunkJson.optString("error").takeIf { it.isNotBlank() }
+                                ?: "Неизвестная ошибка потока"
+                            break
+                        }
+
+                        val choices = chunkJson.optJSONArray("choices")
+                        if (choices != null && choices.length() > 0) {
+                            val choice = choices.getJSONObject(0)
+                            val fr = choice.optString("finish_reason", "")
+                            if (fr.isNotBlank() && fr != "null") {
+                                finishReason = fr
+                            }
+
+                            val delta = choice.optJSONObject("delta")
+                            val content = if (delta != null && !delta.isNull("content")) {
+                                val s = delta.optString("content", "")
+                                if (s == "null") "" else s
+                            } else ""
+
+                            val reasoning = when {
+                                delta != null && !delta.isNull("reasoning_content") -> {
+                                    val s = delta.optString("reasoning_content", "")
                                     if (s == "null") "" else s
-                                } else ""
-
-                                val reasoning = when {
-                                    delta != null && !delta.isNull("reasoning_content") -> {
-                                        val s = delta.optString("reasoning_content", "")
-                                        if (s == "null") "" else s
-                                    }
-                                    delta != null && !delta.isNull("reasoning") -> {
-                                        val s = delta.optString("reasoning", "")
-                                        if (s == "null") "" else s
-                                    }
-                                    else -> ""
                                 }
+                                delta != null && !delta.isNull("reasoning") -> {
+                                    val s = delta.optString("reasoning", "")
+                                    if (s == "null") "" else s
+                                }
+                                else -> ""
+                            }
 
-                                if (reasoning.isNotEmpty()) {
-                                    if (!isThinking) {
+                            // Сборка нативных OpenAI tool_calls (если шлюз перехватил <tool_call> на стороне сервера)
+                            val toolCallsArr = delta?.optJSONArray("tool_calls")
+                            if (toolCallsArr != null) {
+                                for (ti in 0 until toolCallsArr.length()) {
+                                    val tcObj = toolCallsArr.optJSONObject(ti) ?: continue
+                                    val tcIdx = tcObj.optInt("index", ti)
+                                    val fn = tcObj.optJSONObject("function")
+                                    val fnName = fn?.optString("name", "").orEmpty()
+                                    val fnArgs = fn?.optString("arguments", "").orEmpty()
+                                    if (fnName.isNotEmpty()) {
+                                        nativeToolNames.getOrPut(tcIdx) { StringBuilder() }.append(fnName)
+                                    }
+                                    if (fnArgs.isNotEmpty()) {
+                                        nativeToolArgs.getOrPut(tcIdx) { StringBuilder() }.append(fnArgs)
+                                    }
+                                }
+                            }
+
+                            if (reasoning.isNotEmpty()) {
+                                // Убираем дублирующие <think>/</think> внутри поля reasoning
+                                val cleanReasoning = reasoning
+                                    .replace("<think>", "", ignoreCase = true)
+                                    .replace("</think>", "", ignoreCase = true)
+                                if (cleanReasoning.isNotEmpty()) {
+                                    if (!isThinking && !hasStartedContent) {
                                         isThinking = true
                                         onToken("<think>\n")
                                     }
-                                    onToken(reasoning)
-                                }
-                                if (content.isNotEmpty()) {
                                     if (isThinking) {
-                                        isThinking = false
-                                        onToken("\n</think>\n")
+                                        receivedReasoningChars += cleanReasoning.length
+                                        onToken(cleanReasoning)
                                     }
-                                    onToken(content)
                                 }
                             }
-                        } catch (_: Exception) {}
+                            if (content.isNotEmpty()) {
+                                // Не закрываем <think> на пустых/пробельных дельтах между чанками рассуждений
+                                if (isThinking && content.isBlank()) {
+                                    continue
+                                }
+                                var emitContent = content
+                                if (isThinking) {
+                                    isThinking = false
+                                    hasStartedContent = true
+                                    onToken("\n</think>\n")
+                                    // Если модель дополнительно сама прислала ведущий </think> — убираем дубликат
+                                    val trimmedLead = emitContent.trimStart()
+                                    if (trimmedLead.startsWith("</think>", ignoreCase = true)) {
+                                        emitContent = trimmedLead.substring("</think>".length)
+                                    }
+                                } else {
+                                    hasStartedContent = true
+                                }
+                                if (emitContent.isNotEmpty()) {
+                                    receivedContentChars += emitContent.length
+                                    onToken(emitContent)
+                                }
+                            }
+                        }
                     }
                 }
                 // Если поток завершился внутри блока рассуждений, аккуратно закрываем тег <think>
@@ -527,6 +606,40 @@ object OpenCodeClient {
                     onToken("\n</think>\n")
                 }
             }
+
+            if (streamErrorMessage != null && receivedContentChars == 0 && nativeToolNames.isEmpty()) {
+                throw Exception("Ошибка ${provider.displayName}: $streamErrorMessage")
+            }
+
+            val assembledNativeCalls = mutableListOf<AgentToolCall>()
+            for ((idx, nameSb) in nativeToolNames) {
+                val rawName = nameSb.toString().trim().lowercase(Locale.US)
+                if (rawName.isBlank()) continue
+                val toolName = when (rawName) {
+                    "bash", "shell", "termux", "terminal", "exec" -> "run_termux"
+                    else -> rawName
+                }
+                val argsStr = nativeToolArgs[idx]?.toString()?.trim().orEmpty()
+                val argsObj = try {
+                    if (argsStr.isNotEmpty()) JSONObject(argsStr) else JSONObject()
+                } catch (_: Exception) {
+                    JSONObject()
+                }
+                assembledNativeCalls.add(
+                    AgentToolCall(
+                        tool = toolName,
+                        args = argsObj,
+                        rawJson = argsStr.ifBlank { "{}" }
+                    )
+                )
+            }
+
+            return StreamCompletionResult(
+                finishReason = finishReason,
+                nativeToolCalls = assembledNativeCalls,
+                receivedContentChars = receivedContentChars,
+                receivedReasoningChars = receivedReasoningChars
+            )
         } finally {
             conn?.disconnect()
         }

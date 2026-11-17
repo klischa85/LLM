@@ -31,6 +31,12 @@ data class AgentToolCall(
     val rawJson: String
 )
 
+data class ToolCallExtraction(
+    val calls: List<AgentToolCall>,
+    val hadMalformedAttempt: Boolean = false,
+    val malformedReason: String? = null
+)
+
 data class AgentToolResult(
     val tool: String,
     val ok: Boolean,
@@ -71,8 +77,28 @@ object AgentTools {
     )
 
     private val TOOL_CALL_REGEX = Regex(
-        """<tool_call>\s*(.*?)\s*</tool_call>""",
+        """(?:<tool_call>|<\|tool_call\|>|\[TOOL_CALL\])\s*(.*?)\s*(?:</tool_call>|<\|/tool_call\|>|\[/TOOL_CALL\])""",
         setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+    )
+
+    private val FENCED_TOOL_CALL_REGEX = Regex(
+        """```tool_call\s*(.*?)```""",
+        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+    )
+
+    private val THINK_BLOCK_REGEX = Regex(
+        """<(?:think|thought|reasoning)>\s*.*?\s*</(?:think|thought|reasoning)>""",
+        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+    )
+
+    private val OPEN_TOOL_TAG_REGEX = Regex(
+        """(?:<tool_call>|<\|tool_call\|>|\[TOOL_CALL\]|```tool_call\b)""",
+        setOf(RegexOption.IGNORE_CASE)
+    )
+
+    private val STRAY_TOOL_TAG_REGEX = Regex(
+        """</?tool_call>|<\|/?tool_call\|>|\[/?TOOL_CALL\]""",
+        setOf(RegexOption.IGNORE_CASE)
     )
 
     fun storageRoot(): File {
@@ -147,42 +173,358 @@ object AgentTools {
     }
 
     /**
-     * Извлекает все блоки `<tool_call>{...}</tool_call>` из ответа модели.
+     * Извлекает все блоки `<tool_call>{...}</tool_call>` из ответа модели (совместимый фасад).
      */
-    fun extractToolCalls(text: String): List<AgentToolCall> {
-        val result = mutableListOf<AgentToolCall>()
-        for (match in TOOL_CALL_REGEX.findAll(text)) {
-            val rawInner = match.groupValues[1]
-                .trim()
-                .removePrefix("```json")
-                .removePrefix("```JSON")
-                .removePrefix("```")
-                .removeSuffix("```")
-                .trim()
-            if (rawInner.isEmpty()) continue
-            val jsonCandidate = extractFirstJsonObject(rawInner) ?: rawInner
-            try {
-                val obj = JSONObject(jsonCandidate)
-                val toolName = obj.optString("tool").ifBlank { obj.optString("name") }.trim().lowercase(Locale.US)
-                if (toolName.isNotBlank()) {
-                    val argsObj = obj.optJSONObject("args")
-                        ?: obj.optJSONObject("arguments")
-                        ?: obj.optJSONObject("parameters")
-                        ?: JSONObject()
-                    result.add(AgentToolCall(tool = toolName, args = argsObj, rawJson = jsonCandidate))
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Не удалось распарсить <tool_call>: ${e.message} | raw=$rawInner")
+    fun extractToolCalls(text: String): List<AgentToolCall> = extractToolCallsDetailed(text).calls
+
+    /**
+     * Устойчивый парсер вызовов инструментов агента:
+     * - Стандартные `<tool_call>...</tool_call>`, `<|tool_call|>...<|/tool_call|>`, `[TOOL_CALL]...[/TOOL_CALL]`, ```tool_call```
+     * - Вызовы без открывающего тега `{"tool": ...}</tool_call>` (частый артефакт Qwen3 / OpenCode / vLLM)
+     * - Незакрытые `<tool_call>{...}` (если модель забыла `</tool_call>` или оборвалась на EOS)
+     * - Авто-починка неэкранированных переносов строк внутри JSON-строк и висячих запятых
+     * - Поддержка `arguments`/`args` в виде JSON-строки и плоских аргументов без обёртки `args`
+     * - Диагностика сломанной попытки вызова (`hadMalformedAttempt`), чтобы агент мог сам повторить команду вместо остановки.
+     */
+    fun extractToolCallsDetailed(text: String): ToolCallExtraction {
+        // 1. Сначала ищем вне блоков <think>...</think> (чтобы упоминания примеров в рассуждениях не мешали)
+        val outsideThink = stripThinkBlocksForToolSearch(text)
+        val outsideResult = extractFromSegment(outsideThink)
+        if (outsideResult.calls.isNotEmpty()) {
+            return outsideResult
+        }
+
+        // 2. Если вне <think> ничего не нашли, но модель случайно поместила рабочий <tool_call>...</tool_call> внутрь <think>
+        if (text != outsideThink && (text.contains("<tool_call>", ignoreCase = true) || text.contains("</tool_call>", ignoreCase = true))) {
+            val fullResult = extractFromSegment(text)
+            if (fullResult.calls.isNotEmpty()) {
+                return fullResult
+            }
+            if (fullResult.hadMalformedAttempt) {
+                return fullResult
             }
         }
-        return result
+
+        return outsideResult
+    }
+
+    private fun stripThinkBlocksForToolSearch(text: String): String {
+        var working = THINK_BLOCK_REGEX.replace(text, "\n")
+        // Если остался одиночный </think> (шаблон модели префиллил <think>), берём часть ПОСЛЕ последнего </think>
+        val closeIdx = working.lastIndexOf("</think>", ignoreCase = true)
+        if (closeIdx != -1) {
+            working = working.substring(closeIdx + "</think>".length)
+        }
+        return working
+    }
+
+    private fun extractFromSegment(segment: String): ToolCallExtraction {
+        val result = mutableListOf<AgentToolCall>()
+        var malformed = false
+        var malformedReason: String? = null
+        var remainder = segment
+
+        // Проход 1: Полные пары <tool_call>...</tool_call> и ```tool_call ... ```
+        fun collectMatches(regex: Regex) {
+            for (match in regex.findAll(remainder)) {
+                val rawInner = cleanFencedPayload(match.groupValues[1])
+                if (rawInner.isEmpty()) continue
+                val parsed = parseSingleToolJson(rawInner)
+                if (parsed != null) {
+                    result.add(parsed)
+                } else {
+                    malformed = true
+                    malformedReason = "невалидный JSON внутри <tool_call>"
+                    Log.w(TAG, "Не удалось распарсить <tool_call>: raw=${rawInner.take(240)}")
+                }
+            }
+            remainder = regex.replace(remainder, "\n")
+        }
+
+        collectMatches(TOOL_CALL_REGEX)
+        collectMatches(FENCED_TOOL_CALL_REGEX)
+
+        // Проход 2: Вызовы без открывающего `<tool_call>` вида `{"tool": "...", "args": {...}}\n</tool_call>`
+        var orphanGuard = 0
+        while (orphanGuard++ < 12) {
+            val closeIdx = remainder.indexOf("</tool_call>", ignoreCase = true)
+            if (closeIdx == -1) break
+            val before = remainder.substring(0, closeIdx).trimEnd()
+            val after = remainder.substring(closeIdx + "</tool_call>".length)
+            val jsonStart = ThoughtParser.findTrailingJsonObjectStart(before)
+            if (jsonStart != -1) {
+                val candidate = before.substring(jsonStart).trim()
+                val parsed = parseSingleToolJson(candidate)
+                if (parsed != null) {
+                    result.add(parsed)
+                } else {
+                    malformed = true
+                    malformedReason = "обнаружен </tool_call> с некорректным JSON"
+                }
+                remainder = before.substring(0, jsonStart) + "\n" + after
+            } else {
+                // Проверяем, нет ли хотя бы незавершённого JSON перед </tool_call>
+                val openBrace = before.lastIndexOf('{')
+                if (openBrace != -1 && (before.substring(openBrace).contains("\"tool\"") || before.substring(openBrace).contains("\"name\""))) {
+                    val repaired = parseSingleToolJson(before.substring(openBrace))
+                    if (repaired != null) {
+                        result.add(repaired)
+                    } else {
+                        malformed = true
+                        malformedReason = "обнаружен </tool_call> с незавершённым JSON"
+                    }
+                } else if (result.isEmpty()) {
+                    malformed = true
+                    malformedReason = "обнаружен висячий тег </tool_call> без JSON-вызова"
+                }
+                remainder = before + "\n" + after
+            }
+        }
+
+        // Проход 3: Незакрытый открывающий `<tool_call>` в хвосте ответа
+        val openMatch = OPEN_TOOL_TAG_REGEX.find(remainder)
+        if (openMatch != null) {
+            val tail = cleanFencedPayload(remainder.substring(openMatch.range.last + 1))
+            val parsed = if (tail.isNotBlank()) parseSingleToolJson(tail) else null
+            if (parsed != null) {
+                result.add(parsed)
+            } else {
+                malformed = true
+                malformedReason = "блок <tool_call> не был закрыт или оборвался на середине JSON"
+            }
+        }
+
+        return ToolCallExtraction(
+            calls = result,
+            hadMalformedAttempt = malformed && result.isEmpty(),
+            malformedReason = if (malformed && result.isEmpty()) malformedReason else null
+        )
+    }
+
+    private fun cleanFencedPayload(raw: String): String {
+        return raw.trim()
+            .removePrefix("```json")
+            .removePrefix("```JSON")
+            .removePrefix("```tool_call")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+    }
+
+    private fun parseSingleToolJson(rawInner: String): AgentToolCall? {
+        val candidate = extractFirstJsonObject(rawInner) ?: rawInner.trim()
+        if (!candidate.startsWith("{")) return null
+
+        val obj = tryParseJsonObject(candidate) ?: return null
+        val fnObj = obj.optJSONObject("function")
+        val rawToolName = obj.optString("tool")
+            .ifBlank { obj.optString("name") }
+            .ifBlank { fnObj?.optString("name").orEmpty() }
+            .trim()
+            .lowercase(Locale.US)
+        if (rawToolName.isBlank()) return null
+
+        val toolName = when (rawToolName) {
+            "bash", "shell", "termux", "terminal", "exec" -> "run_termux"
+            else -> rawToolName
+        }
+
+        val rawArgsAny = obj.opt("args")
+            ?: obj.opt("arguments")
+            ?: obj.opt("parameters")
+            ?: fnObj?.opt("arguments")
+            ?: fnObj?.opt("parameters")
+
+        val argsObj: JSONObject = when (rawArgsAny) {
+            is JSONObject -> rawArgsAny
+            is String -> tryParseJsonObject(rawArgsAny.trim()) ?: JSONObject()
+            else -> {
+                // Поддержка плоского JSON вида {"tool": "list_dir", "path": "/sdcard"} (частый формат малых GGUF-моделей)
+                val flat = JSONObject()
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    if (k !in setOf("tool", "name", "type", "id", "function", "args", "arguments", "parameters")) {
+                        flat.put(k, obj.get(k))
+                    }
+                }
+                flat
+            }
+        }
+
+        return AgentToolCall(tool = toolName, args = argsObj, rawJson = candidate)
+    }
+
+    private fun tryParseJsonObject(raw: String): JSONObject? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return null
+        try {
+            return JSONObject(trimmed)
+        } catch (_: Exception) {}
+
+        val repaired = repairJson(trimmed)
+        try {
+            return JSONObject(repaired)
+        } catch (_: Exception) {}
+
+        // Попытка закрыть 1–2 недостающие `}` в конце (если модель оборвалась в самом конце JSON)
+        var padded = repaired
+        repeat(2) {
+            padded += "}"
+            try {
+                return JSONObject(padded)
+            } catch (_: Exception) {}
+        }
+        return null
     }
 
     /**
-     * Удаляет сырые блоки `<tool_call>...</tool_call>` из видимого текста сообщения (для красивого отображения в чате).
+     * Чинит частые огрехи JSON от LLM: сырые переносы строк/табы внутри строковых литералов и висячие запятые.
+     */
+    private fun repairJson(raw: String): String {
+        val sb = StringBuilder(raw.length + 32)
+        var inString = false
+        var escaped = false
+        for (i in raw.indices) {
+            val c = raw[i]
+            if (escaped) {
+                sb.append(c)
+                escaped = false
+                continue
+            }
+            if (inString) {
+                when (c) {
+                    '\\' -> {
+                        sb.append(c)
+                        escaped = true
+                    }
+                    '"' -> {
+                        sb.append(c)
+                        inString = false
+                    }
+                    '\n' -> sb.append("\\n")
+                    '\r' -> sb.append("\\r")
+                    '\t' -> sb.append("\\t")
+                    else -> sb.append(c)
+                }
+            } else {
+                if (c == '"') {
+                    inString = true
+                }
+                sb.append(c)
+            }
+        }
+        // Убираем висячие запятые перед } или ]
+        return sb.toString().replace(Regex(",\\s*([}\\]])"), "$1")
+    }
+
+    /**
+     * Удаляет сырые блоки `<tool_call>...</tool_call>`, обрывки без открывающего/закрывающего тега
+     * и любые висячие теги `</tool_call>` из видимого текста, НЕ затрагивая `<think>...</think>`.
      */
     fun stripToolCallBlocks(text: String): String {
-        return TOOL_CALL_REGEX.replace(text, "").replace(Regex("\\n{3,}"), "\n\n").trim()
+        var cleaned = TOOL_CALL_REGEX.replace(text, "")
+        cleaned = FENCED_TOOL_CALL_REGEX.replace(cleaned, "")
+        // Убираем блоки `{"tool": ...}</tool_call>` без открывающего тега
+        var guard = 0
+        while (guard++ < 12) {
+            val closeIdx = cleaned.indexOf("</tool_call>", ignoreCase = true)
+            if (closeIdx == -1) break
+            val before = cleaned.substring(0, closeIdx).trimEnd()
+            val after = cleaned.substring(closeIdx + "</tool_call>".length)
+            val jsonStart = ThoughtParser.findTrailingJsonObjectStart(before)
+            cleaned = if (jsonStart != -1 && (before.substring(jsonStart).contains("\"tool\"") || before.substring(jsonStart).contains("\"name\""))) {
+                before.substring(0, jsonStart).trimEnd() + "\n" + after.trimStart()
+            } else {
+                before + after
+            }
+        }
+        val unclosed = OPEN_TOOL_TAG_REGEX.find(cleaned)
+        if (unclosed != null) {
+            cleaned = cleaned.substring(0, unclosed.range.first)
+        }
+        cleaned = STRAY_TOOL_TAG_REGEX.replace(cleaned, "")
+        return cleaned.replace(Regex("\\n{3,}"), "\n\n").trim()
+    }
+
+    /**
+     * Формирует чистую реплику ассистента для истории следующего шага агента:
+     * полностью удаляет `<think>...</think>` (которые ломают DeepSeek-R1 / Qwen3 в многошаговой истории)
+     * и оставляет канонические блоки `<tool_call>...</tool_call>`.
+     */
+    fun buildAssistantTurnForHistory(stepRaw: String, calls: List<AgentToolCall>): String {
+        val visibleText = ThoughtParser.parse(stepRaw, isStreaming = false).answerText
+        val canonicalCalls = calls.joinToString("\n") { call ->
+            val obj = JSONObject().apply {
+                put("tool", call.tool)
+                put("args", call.args)
+            }
+            "<tool_call>\n$obj\n</tool_call>"
+        }
+        return listOf(visibleText, canonicalCalls)
+            .filter { it.isNotBlank() }
+            .joinToString("\n\n")
+            .ifBlank { canonicalCalls }
+    }
+
+    /**
+     * Читаемое представление параметров вызова инструмента для разворачиваемой карточки действий агента.
+     */
+    fun formatArgsForDisplay(call: AgentToolCall): String {
+        val a = call.args
+        return when (call.tool) {
+            "list_dir" -> buildString {
+                append("Путь: ${a.optString("path", "/sdcard").ifBlank { "/sdcard" }}")
+                if (a.optBoolean("recursive", false)) append("\nРекурсивно: да")
+            }
+            "read_file" -> buildString {
+                append("Файл: ${a.optString("path", "")}")
+                val offset = a.optInt("offset", 1)
+                val limit = a.optInt("limit", 250)
+                append("\nСтроки: с $offset (лимит $limit)")
+            }
+            "search_files" -> buildString {
+                append("Папка: ${a.optString("path", "/sdcard").ifBlank { "/sdcard" }}")
+                append("\nЗапрос: ${a.optString("query", "")}")
+                if (a.optBoolean("content_search", false)) append("\nПоиск по содержимому: да")
+            }
+            "file_info", "mkdir" -> "Путь: ${a.optString("path", "")}"
+            "write_file" -> {
+                val p = a.optString("path", "")
+                val content = a.optString("content", "")
+                val sizeStr = UniversalFileParser.formatSize(content.toByteArray(Charsets.UTF_8).size.toLong())
+                buildString {
+                    append("Файл: $p ($sizeStr)\n")
+                    append(content.take(1500))
+                    if (content.length > 1500) append("\n… (ещё ${content.length - 1500} симв.)")
+                }
+            }
+            "edit_file" -> {
+                val p = a.optString("path", "")
+                val oldText = a.optString("old_text", "")
+                val newText = a.optString("new_text", "")
+                buildString {
+                    append("Файл: $p\n")
+                    append("--- Было:\n${oldText.take(700)}${if (oldText.length > 700) "…" else ""}\n")
+                    append("+++ Стало:\n${newText.take(700)}${if (newText.length > 700) "…" else ""}")
+                }
+            }
+            "move_file" -> "Откуда: ${a.optString("source", "")}\nКуда: ${a.optString("destination", "")}"
+            "delete_file" -> buildString {
+                append("Путь: ${a.optString("path", "")}")
+                if (a.optBoolean("recursive", false)) append("\nРекурсивно: да")
+            }
+            "run_termux" -> {
+                val cmd = a.optString("command", "")
+                val workdir = a.optString("workdir", storageRootCanonical()).ifBlank { storageRootCanonical() }
+                "Каталог: $workdir\n$ $cmd"
+            }
+            else -> try {
+                a.toString(2).take(1200)
+            } catch (_: Exception) {
+                call.rawJson.take(1200)
+            }
+        }
     }
 
     private fun extractFirstJsonObject(raw: String): String? {
@@ -242,7 +584,7 @@ object AgentTools {
     }
 
     /**
-     * Строит данные для интерактивной карточки подтверждения в чате.
+     * Строит данные для интерактивной карточки подтверждения в чате (с полным предпросмотром для разворачивания).
      */
     fun buildApprovalPrompt(call: AgentToolCall): PendingToolApproval {
         return when (call.tool) {
@@ -272,7 +614,7 @@ object AgentTools {
                 val exists = target != null && target.exists()
                 val sizeOld = if (exists) UniversalFileParser.formatSize(target!!.length()) else ""
                 val sizeNew = UniversalFileParser.formatSize(content.toByteArray(Charsets.UTF_8).size.toLong())
-                val preview = content.take(280) + if (content.length > 280) "\n…" else ""
+                val preview = content.take(2000) + if (content.length > 2000) "\n… (ещё ${content.length - 2000} симв.)" else ""
                 PendingToolApproval(
                     call = call,
                     title = if (exists) "Перезапись файла" else "Создание файла",
@@ -288,8 +630,8 @@ object AgentTools {
                 val newText = call.args.optString("new_text", "")
                 val target = resolveSafeSdcardPath(p)
                 val preview = buildString {
-                    append("- ${oldText.take(140)}${if (oldText.length > 140) "…" else ""}\n")
-                    append("+ ${newText.take(140)}${if (newText.length > 140) "…" else ""}")
+                    append("- ${oldText.take(800)}${if (oldText.length > 800) "…" else ""}\n")
+                    append("+ ${newText.take(800)}${if (newText.length > 800) "…" else ""}")
                 }
                 PendingToolApproval(
                     call = call,
