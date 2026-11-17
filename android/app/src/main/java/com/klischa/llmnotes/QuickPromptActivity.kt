@@ -40,6 +40,7 @@ import androidx.lifecycle.lifecycleScope
 import com.klischa.llmnotes.api.ApiChatMessage
 import com.klischa.llmnotes.api.LLMProviderType
 import com.klischa.llmnotes.api.OpenCodeClient
+import com.klischa.llmnotes.security.SecureKeyStore
 import com.klischa.llmnotes.ui.LLMNotesTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -131,30 +132,35 @@ fun QuickPromptDialogContent(
     var currentJob by remember { mutableStateOf<Job?>(null) }
     val cancelRequested = remember { AtomicBoolean(false) }
 
-    // Чтение настроек провайдера из SharedPreferences
+    // Чтение настроек провайдера из SharedPreferences и зашифрованного SecureKeyStore
     val prefs = remember { context.getSharedPreferences("llm_app_prefs", Context.MODE_PRIVATE) }
     val providerStr = prefs.getString("provider_type", LLMProviderType.LOCAL_GGUF.name)
     val provider = try { LLMProviderType.valueOf(providerStr ?: "") } catch (_: Exception) { LLMProviderType.LOCAL_GGUF }
+    val customBaseUrl = prefs.getString("custom_openai_base_url", "") ?: ""
+    val thinkingEnabled = prefs.getBoolean("thinking_enabled", true)
 
     val modelName = when (provider) {
-        LLMProviderType.DEEPSEEK -> prefs.getString("deepseek_model", "deepseek-chat") ?: "deepseek-chat"
-        LLMProviderType.OPENROUTER -> prefs.getString("openrouter_model", "google/gemini-2.0-flash-exp:free") ?: "OpenRouter Free"
-        LLMProviderType.GROQ -> prefs.getString("groq_model", "llama-3.3-70b-versatile") ?: "Groq Free"
-        LLMProviderType.OPENCODE_ZEN -> prefs.getString("opencode_model_zen", "qwen3.6-plus") ?: "OpenCode ZEN"
-        LLMProviderType.OPENCODE_GO -> prefs.getString("opencode_model_go", "deepseek-v4-pro") ?: "OpenCode GO"
         LLMProviderType.LOCAL_GGUF -> prefs.getString("last_model_name", "Офлайн GGUF") ?: "Офлайн GGUF"
+        LLMProviderType.DEEPSEEK -> prefs.getString("deepseek_model", null)
+            ?: prefs.getString("model_${provider.name}", OpenCodeClient.getDefaultModel(provider))
+            ?: OpenCodeClient.getDefaultModel(provider)
+        LLMProviderType.OPENROUTER -> prefs.getString("openrouter_model", null)
+            ?: prefs.getString("model_${provider.name}", OpenCodeClient.getDefaultModel(provider))
+            ?: OpenCodeClient.getDefaultModel(provider)
+        LLMProviderType.GROQ -> prefs.getString("groq_model", null)
+            ?: prefs.getString("model_${provider.name}", OpenCodeClient.getDefaultModel(provider))
+            ?: OpenCodeClient.getDefaultModel(provider)
+        LLMProviderType.OPENCODE_ZEN -> prefs.getString("opencode_model_zen", null)
+            ?: prefs.getString("model_${provider.name}", OpenCodeClient.getDefaultModel(provider))
+            ?: OpenCodeClient.getDefaultModel(provider)
+        LLMProviderType.OPENCODE_GO -> prefs.getString("opencode_model_go", null)
+            ?: prefs.getString("model_${provider.name}", OpenCodeClient.getDefaultModel(provider))
+            ?: OpenCodeClient.getDefaultModel(provider)
+        else -> prefs.getString("model_${provider.name}", OpenCodeClient.getDefaultModel(provider))
+            ?: OpenCodeClient.getDefaultModel(provider)
     }
 
-    val apiKey = when (provider) {
-        LLMProviderType.DEEPSEEK -> prefs.getString("deepseek_key", "") ?: ""
-        LLMProviderType.OPENROUTER -> prefs.getString("openrouter_key", "") ?: ""
-        LLMProviderType.GROQ -> prefs.getString("groq_key", "") ?: ""
-        LLMProviderType.OPENCODE_ZEN -> prefs.getString("opencode_zen_key", null)
-            ?: prefs.getString("opencode_api_key", "") ?: ""
-        LLMProviderType.OPENCODE_GO -> prefs.getString("opencode_go_key", null)
-            ?: prefs.getString("opencode_api_key", "") ?: ""
-        LLMProviderType.LOCAL_GGUF -> ""
-    }
+    val hasSavedKey = remember(provider) { SecureKeyStore.hasKey(context, provider) }
 
     val stopCurrentGeneration = {
         cancelRequested.set(true)
@@ -365,7 +371,11 @@ fun QuickPromptDialogContent(
 
                         val currentAttached = attachedDoc
                         if (inputText.isBlank() && currentAttached == null) return@Button
-                        if (provider != LLMProviderType.LOCAL_GGUF && apiKey.isBlank()) {
+                        if (provider == LLMProviderType.CUSTOM_OPENAI && customBaseUrl.isBlank()) {
+                            Toast.makeText(context, "Укажите Base URL для Custom API в настройках приложения", Toast.LENGTH_LONG).show()
+                            return@Button
+                        }
+                        if (provider != LLMProviderType.LOCAL_GGUF && provider.requiresApiKey && !hasSavedKey) {
                             Toast.makeText(context, "Укажите API-ключ для ${provider.displayName} в настройках приложения", Toast.LENGTH_LONG).show()
                             return@Button
                         }
@@ -408,10 +418,15 @@ fun QuickPromptDialogContent(
                                     }
                                 }
 
-                                val systemContext = if (DeviceTools.isDeviceQuery(queryText)) {
+                                val baseSystem = if (DeviceTools.isDeviceQuery(queryText)) {
                                     DeviceTools.buildTelemetryContext(context)
                                 } else {
                                     "Ты — краткий, умный и точный русскоязычный персональный ассистент."
+                                }
+                                val systemContext = if (!thinkingEnabled) {
+                                    "$baseSystem\nОтвечай сразу и по существу, без промежуточных рассуждений и без блоков <think>. /no_think"
+                                } else {
+                                    baseSystem
                                 }
 
                                 val responseBuilder = StringBuilder()
@@ -419,22 +434,25 @@ fun QuickPromptDialogContent(
 
                                 if (provider != LLMProviderType.LOCAL_GGUF) {
                                     didRunInference = true
+                                    val decryptedKey = SecureKeyStore.getKey(context, provider)
                                     val messages = listOf(
                                         ApiChatMessage("system", systemContext),
                                         ApiChatMessage("user", finalPrompt, imageDataUrls = imageDataUrls)
                                     )
                                     OpenCodeClient.streamChatCompletions(
                                         provider = provider,
-                                        apiKey = apiKey,
+                                        apiKey = decryptedKey,
                                         model = modelName,
                                         messages = messages,
+                                        customBaseUrl = customBaseUrl,
+                                        thinkingEnabled = thinkingEnabled,
                                         onToken = { token ->
                                             responseBuilder.append(token)
                                             val cur = ThoughtParser.cleanStopTokens(responseBuilder.toString())
                                             val parsed = ThoughtParser.parse(cur, isStreaming = true)
                                             val preview = if (parsed.answerText.isNotBlank()) {
                                                 parsed.answerText
-                                            } else if (parsed.isStillThinking || parsed.thinkingText != null) {
+                                            } else if (thinkingEnabled && (parsed.isStillThinking || parsed.thinkingText != null)) {
                                                 "💭 Размышляет..."
                                             } else {
                                                 cur

@@ -2,7 +2,9 @@
 
 package com.klischa.llmnotes.ui
 
+import android.content.Intent
 import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.util.Base64
@@ -57,7 +59,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.klischa.llmnotes.AgentConfirmationMode
@@ -68,6 +69,7 @@ import com.klischa.llmnotes.LLMViewModel
 import com.klischa.llmnotes.MessageRole
 import com.klischa.llmnotes.ParsedMessage
 import com.klischa.llmnotes.PendingToolApproval
+import com.klischa.llmnotes.QueuedFollowUp
 import com.klischa.llmnotes.R
 import com.klischa.llmnotes.SystemPromptPreset
 import com.klischa.llmnotes.TermuxBridge
@@ -86,6 +88,7 @@ fun ChatScreen(
     viewModel: LLMViewModel,
     onSelectModelClick: () -> Unit,
     onAttachFileClick: () -> Unit = {},
+    onImportSkillFileClick: () -> Unit = {},
     onRequestTermuxPermissionClick: () -> Unit = {},
     onOpenStoragePermissionClick: () -> Unit = {}
 ) {
@@ -134,6 +137,16 @@ fun ChatScreen(
             onRequestTermuxPermissionClick = onRequestTermuxPermissionClick,
             onOpenStoragePermissionClick = onOpenStoragePermissionClick,
             onDismiss = { viewModel.setAgentDialogVisible(false) }
+        )
+    }
+
+    // Диалог управления скиллами (Agent Skills / SKILL.md)
+    if (uiState.isSkillsDialogVisible) {
+        SkillsDialog(
+            uiState = uiState,
+            viewModel = viewModel,
+            onImportSkillFileClick = onImportSkillFileClick,
+            onDismiss = { viewModel.setSkillsDialogVisible(false) }
         )
     }
 
@@ -406,6 +419,15 @@ fun ChatScreen(
                 // 2. Информационная плашка статуса модели и производительности
                 DeviceStatusStrip(uiState)
 
+                // 2.5. Панель быстрого управления: Режим размышления (Вкл/Выкл), Скиллы, Провайдер
+                QuickControlsBar(
+                    uiState = uiState,
+                    onToggleThinking = { viewModel.toggleThinkingEnabled() },
+                    onOpenSkills = { viewModel.setSkillsDialogVisible(true) },
+                    onOpenProviders = { viewModel.setProviderDialogVisible(true) },
+                    onOpenAgent = { viewModel.setAgentDialogVisible(true) }
+                )
+
                 // 3. Область сообщений чата
                 Box(
                     modifier = Modifier
@@ -429,6 +451,7 @@ fun ChatScreen(
                             items(uiState.messages, key = { it.id }) { message ->
                                 ChatMessageBubble(
                                     message = message,
+                                    showThinking = uiState.thinkingEnabled,
                                     onCopyClick = {
                                         val parsedCopy = ThoughtParser.parse(message.text, false)
                                         val textToCopy = parsedCopy.answerText.ifBlank {
@@ -488,14 +511,19 @@ fun ChatScreen(
                     onChipClick = { type -> viewModel.insertNotePrompt(type) }
                 )
 
-                // 5. Поле ввода сообщения и кнопка отправки/остановки со скрепкой
+                // 5. Поле ввода сообщения, очередь дополнений и кнопки отправки/очереди/остановки
                 ChatInputBar(
                     uiState = uiState,
                     onInputTextChange = { viewModel.updateInputText(it) },
                     onSendClick = { viewModel.sendMessage() },
+                    onEnqueueClick = { viewModel.enqueueFollowUp() },
                     onStopClick = { viewModel.stopGeneration() },
                     onAttachFileClick = onAttachFileClick,
-                    onRemoveAttachmentClick = { viewModel.clearAttachment() }
+                    onRemoveAttachmentClick = { viewModel.clearAttachment() },
+                    onEditQueuedItem = { viewModel.editQueuedFollowUp(it) },
+                    onRemoveQueuedItem = { viewModel.removeQueuedFollowUp(it) },
+                    onClearQueue = { viewModel.clearQueuedFollowUps() },
+                    onSendNextQueuedNow = { viewModel.sendNextQueuedNow() }
                 )
             }
         }
@@ -527,7 +555,7 @@ fun DeviceStatusStrip(uiState: UiState) {
                             .background(
                                 when {
                                     isLocal && uiState.isModelLoaded -> Color(0xFF4CAF50)
-                                    !isLocal && uiState.currentApiKey.isNotBlank() -> Color(0xFF4CAF50)
+                                    !isLocal && uiState.isReadyToChat -> Color(0xFF4CAF50)
                                     uiState.isLoadingModel -> Color(0xFF2196F3)
                                     else -> Color(0xFFFF9800)
                                 },
@@ -540,7 +568,11 @@ fun DeviceStatusStrip(uiState: UiState) {
                             isLocal && uiState.isModelLoaded -> "Модель активна"
                             isLocal && uiState.isLoadingModel -> "Загрузка модели..."
                             isLocal -> "Модель не выбрана"
-                            !isLocal && uiState.currentApiKey.isNotBlank() -> "${uiState.providerType.displayName} активен"
+                            !isLocal && uiState.isReadyToChat -> {
+                                val lock = if (uiState.hasCurrentApiKey) " 🔒" else ""
+                                "${uiState.providerType.displayName}$lock"
+                            }
+                            uiState.providerType == LLMProviderType.CUSTOM_OPENAI -> "Требуется Base URL"
                             else -> "Требуется API-ключ"
                         },
                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
@@ -599,6 +631,73 @@ fun DeviceStatusStrip(uiState: UiState) {
 }
 
 @Composable
+fun QuickControlsBar(
+    uiState: UiState,
+    onToggleThinking: () -> Unit,
+    onOpenSkills: () -> Unit,
+    onOpenProviders: () -> Unit,
+    onOpenAgent: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // 1-клик переключатель режима размышления (Вкл / Выкл)
+        FilterChip(
+            selected = uiState.thinkingEnabled,
+            onClick = onToggleThinking,
+            label = {
+                Text(
+                    text = if (uiState.thinkingEnabled) "💭 Размышления: Вкл" else "⚡ Размышления: Выкл",
+                    fontSize = 11.sp
+                )
+            }
+        )
+
+        // 1-клик открытие каталога и управления скиллами (Skills)
+        FilterChip(
+            selected = uiState.activeSkillsCount > 0,
+            onClick = onOpenSkills,
+            label = {
+                val badge = if (uiState.activeSkillsCount > 0) " (${uiState.activeSkillsCount})" else ""
+                Text(
+                    text = "🧩 Скиллы$badge",
+                    fontSize = 11.sp
+                )
+            }
+        )
+
+        // Быстрый доступ к выбору API-провайдера
+        FilterChip(
+            selected = uiState.providerType != LLMProviderType.LOCAL_GGUF,
+            onClick = onOpenProviders,
+            label = {
+                Text(
+                    text = uiState.providerType.chipLabel,
+                    fontSize = 11.sp
+                )
+            }
+        )
+
+        // Индикатор режима агента
+        FilterChip(
+            selected = uiState.agentModeEnabled,
+            onClick = onOpenAgent,
+            label = {
+                Text(
+                    text = if (uiState.agentModeEnabled) "🤖 Агент: Вкл" else "🤖 Агент: Выкл",
+                    fontSize = 11.sp
+                )
+            }
+        )
+    }
+}
+
+@Composable
 fun SystemPromptCard(uiState: UiState, viewModel: LLMViewModel) {
     Card(
         modifier = Modifier
@@ -645,6 +744,35 @@ fun SystemPromptCard(uiState: UiState, viewModel: LLMViewModel) {
                     .heightIn(min = 70.dp, max = 130.dp),
                 shape = RoundedCornerShape(10.dp)
             )
+
+            // Переключатель режима размышления (Thinking)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "💭 Режим размышления (Thinking)",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold)
+                    )
+                    Text(
+                        text = if (uiState.thinkingEnabled) {
+                            "Модель может размышлять в скрываемом блоке перед ответом"
+                        } else {
+                            "Отключено: прямые быстрые ответы без блока рассуждений"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = uiState.thinkingEnabled,
+                    onCheckedChange = { viewModel.setThinkingEnabled(it) }
+                )
+            }
 
             // Переключатель потоков (для локальной модели)
             if (uiState.providerType == LLMProviderType.LOCAL_GGUF) {
@@ -707,9 +835,10 @@ fun EmptyChatPlaceholder(
                 Text(
                     text = when {
                         isLocal && uiState.isModelLoaded -> "Модель готова к диалогу. Введите сообщение ниже или воспользуйтесь быстрыми кнопками."
-                        isLocal -> "Загрузите GGUF-модель (Qwen 2.5, Llama 3.2), чтобы начать общение, либо подключите облачный API."
-                        !isLocal && uiState.currentApiKey.isNotBlank() -> "Модель ${uiState.openCodeSelectedModel} готова к работе через ${uiState.providerType.displayName}."
-                        else -> "Введите API-ключ для доступа к ${uiState.providerType.displayName}."
+                        isLocal -> "Загрузите GGUF-модель (Qwen 2.5, Llama 3.2), чтобы начать общение, либо подключите бесплатный облачный API."
+                        !isLocal && uiState.isReadyToChat -> "Модель ${uiState.openCodeSelectedModel} готова к работе через ${uiState.providerType.displayName}."
+                        uiState.providerType == LLMProviderType.CUSTOM_OPENAI -> "Укажите Base URL вашего OpenAI-совместимого сервера в настройках провайдера."
+                        else -> "Введите API-ключ для доступа к ${uiState.providerType.displayName} (ключ шифруется в Android Keystore)."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -736,17 +865,17 @@ fun EmptyChatPlaceholder(
                         ) {
                             Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Подключить DeepSeek / Облако")
+                            Text("Подключить бесплатный API / Облако")
                         }
                     }
-                } else if (!isLocal && uiState.currentApiKey.isBlank()) {
+                } else if (!isLocal && !uiState.isReadyToChat) {
                     Button(
                         onClick = onOpenProviderSettings,
                         shape = RoundedCornerShape(10.dp)
                     ) {
                         Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Ввести API-ключ")
+                        Text(if (uiState.providerType == LLMProviderType.CUSTOM_OPENAI) "Настроить Base URL" else "Ввести API-ключ")
                     }
                 }
             }
@@ -760,17 +889,62 @@ fun ProviderSettingsDialog(
     viewModel: LLMViewModel,
     onDismiss: () -> Unit
 ) {
-    val currentKey = uiState.currentApiKey
-    var apiKeyText by remember(uiState.providerType, currentKey) { mutableStateOf(currentKey) }
-    var showApiKey by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val provider = uiState.providerType
+    val allProviders = remember { LLMProviderType.values().toList() }
+    val freeProviders = remember { allProviders.filter { it.hasFreeTier } }
+
+    var showOnlyFree by remember { mutableStateOf(provider.hasFreeTier) }
+    var apiKeyDraft by remember(provider) { mutableStateOf("") }
+    var isEditingKey by remember(provider, uiState.hasCurrentApiKey) {
+        mutableStateOf(!uiState.hasCurrentApiKey)
+    }
+
+    fun openProviderKeyPage(url: String) {
+        if (url.isBlank()) return
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(context, "Не удалось открыть браузер: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun saveDraftIfPresent() {
+        val trimmed = apiKeyDraft.trim()
+        if (trimmed.isNotEmpty()) {
+            viewModel.saveProviderApiKey(trimmed, provider)
+            apiKeyDraft = ""
+            isEditingKey = false
+            Toast.makeText(context, "🔒 API-ключ зашифрован и скрыт", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val displayedProviders = if (showOnlyFree) {
+        if (provider in freeProviders) freeProviders else freeProviders + provider
+    } else {
+        allProviders
+    }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            saveDraftIfPresent()
+            onDismiss()
+        },
         title = {
-            Text(
-                text = "Провайдер LLM и модели",
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
-            )
+            Column {
+                Text(
+                    text = "Провайдеры LLM и API-ключи",
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                )
+                Text(
+                    text = "🔒 Все ключи шифруются в Android Keystore",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF2E7D32)
+                )
+            }
         },
         text = {
             Column(
@@ -779,111 +953,237 @@ fun ProviderSettingsDialog(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text(
-                    text = "Выберите источник инференса:",
-                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
-                )
+                // Фильтр: Бесплатные vs Все провайдеры
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    FilterChip(
+                        selected = showOnlyFree,
+                        onClick = { showOnlyFree = true },
+                        label = { Text("🆓 С бесплатным тарифом (${freeProviders.size})", fontSize = 11.sp) }
+                    )
+                    FilterChip(
+                        selected = !showOnlyFree,
+                        onClick = { showOnlyFree = false },
+                        label = { Text("Все (${allProviders.size})", fontSize = 11.sp) }
+                    )
+                }
 
-                // Чипы выбора провайдера
+                // Горизонтальная карусель чипов провайдеров (с индикатором сохранённого ключа 🔒)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    FilterChip(
-                        selected = uiState.providerType == LLMProviderType.LOCAL_GGUF,
-                        onClick = { viewModel.setProviderType(LLMProviderType.LOCAL_GGUF) },
-                        label = { Text("📱 Офлайн", fontSize = 11.sp) }
-                    )
-                    FilterChip(
-                        selected = uiState.providerType == LLMProviderType.DEEPSEEK,
-                        onClick = { viewModel.setProviderType(LLMProviderType.DEEPSEEK) },
-                        label = { Text("🐳 DeepSeek", fontSize = 11.sp) }
-                    )
-                    FilterChip(
-                        selected = uiState.providerType == LLMProviderType.OPENROUTER,
-                        onClick = { viewModel.setProviderType(LLMProviderType.OPENROUTER) },
-                        label = { Text("🌐 OpenRouter Free", fontSize = 11.sp) }
-                    )
-                    FilterChip(
-                        selected = uiState.providerType == LLMProviderType.GROQ,
-                        onClick = { viewModel.setProviderType(LLMProviderType.GROQ) },
-                        label = { Text("⚡ Groq Free", fontSize = 11.sp) }
-                    )
-                    FilterChip(
-                        selected = uiState.providerType == LLMProviderType.OPENCODE_ZEN,
-                        onClick = { viewModel.setProviderType(LLMProviderType.OPENCODE_ZEN) },
-                        label = { Text("🧘 Zen", fontSize = 11.sp) }
-                    )
-                    FilterChip(
-                        selected = uiState.providerType == LLMProviderType.OPENCODE_GO,
-                        onClick = { viewModel.setProviderType(LLMProviderType.OPENCODE_GO) },
-                        label = { Text("🚀 Go", fontSize = 11.sp) }
-                    )
+                    displayedProviders.forEach { item ->
+                        val hasKey = uiState.savedKeyMasks.containsKey(item)
+                        val labelSuffix = when {
+                            hasKey -> " 🔒"
+                            item.hasFreeTier && item != LLMProviderType.LOCAL_GGUF && item != LLMProviderType.CUSTOM_OPENAI -> " • Free"
+                            else -> ""
+                        }
+                        FilterChip(
+                            selected = provider == item,
+                            onClick = {
+                                saveDraftIfPresent()
+                                viewModel.setProviderType(item)
+                            },
+                            label = {
+                                Text(
+                                    text = item.chipLabel + labelSuffix,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        )
+                    }
                 }
 
-                if (uiState.providerType != LLMProviderType.LOCAL_GGUF) {
-                    // Описание провайдера
+                if (provider != LLMProviderType.LOCAL_GGUF) {
+                    // Карточка провайдера + кнопка перехода на страницу получения API-ключа прямо в браузере
                     Card(
                         colors = CardDefaults.cardColors(
                             containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
                         ),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(10.dp)
                     ) {
-                        Text(
-                            text = when (uiState.providerType) {
-                                LLMProviderType.DEEPSEEK ->
-                                    "🐳 DeepSeek API: официальный API DeepSeek (deepseek-chat — DeepSeek V3, deepseek-reasoner — DeepSeek R1 с рассуждениями). Получите ключ на platform.deepseek.com/api_keys."
-                                LLMProviderType.OPENROUTER ->
-                                    "🌐 OpenRouter: десятки бесплатных моделей с суффиксом :free (Gemini 2.0 Flash, LLaMA 3.3 70B, Qwen 2.5 Coder, DeepSeek R1). Получите бесплатный ключ на openrouter.ai/keys."
-                                LLMProviderType.GROQ ->
-                                    "⚡ Groq Cloud: сверхбыстрый бесплатный доступ (до 200+ tok/s) к LLaMA 3.3 70B, LLaMA 3.1 8B, DeepSeek R1 Distill. Получите бесплатный ключ на console.groq.com/keys."
-                                LLMProviderType.OPENCODE_ZEN ->
-                                    "🧘 OpenCode ZEN: доступ к платным моделям (Qwen 3.6 Plus, Claude 3.7 Sonnet, GPT-4o, DeepSeek R1). Получите ключ на opencode.ai/auth."
-                                LLMProviderType.OPENCODE_GO ->
-                                    "🚀 OpenCode GO: открытые и кодинг-модели по подписке GO (DeepSeek V4 Pro, Kimi K2.6, Qwen 3.6). Получите ключ на opencode.ai/auth."
-                                LLMProviderType.LOCAL_GGUF -> ""
-                            },
-                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                            modifier = Modifier.padding(8.dp)
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = provider.displayName,
+                                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                                )
+                                if (provider.hasFreeTier) {
+                                    Surface(
+                                        color = Color(0xFF2E7D32).copy(alpha = 0.16f),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text(
+                                            text = "FREE TIER",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = Color(0xFF2E7D32),
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Text(
+                                text = provider.description,
+                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp)
+                            )
+
+                            if (provider.apiKeyUrl.isNotBlank() && provider != LLMProviderType.CUSTOM_OPENAI) {
+                                OutlinedButton(
+                                    onClick = { openProviderKeyPage(provider.apiKeyUrl) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                                ) {
+                                    Text(
+                                        text = "🌐 Получить API-ключ → ${provider.apiKeyUrlLabel}",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Произвольный Base URL для CUSTOM_OPENAI (Ollama, LM Studio, Together, свой прокси)
+                    if (provider == LLMProviderType.CUSTOM_OPENAI) {
+                        OutlinedTextField(
+                            value = uiState.customBaseUrl,
+                            onValueChange = { viewModel.setCustomBaseUrl(it) },
+                            label = { Text("Base URL (OpenAI-совместимый) *", fontSize = 11.sp) },
+                            placeholder = { Text("https://api.together.xyz/v1 или http://192.168.1.5:11434/v1", fontSize = 11.sp) },
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
                         )
                     }
 
-                    // Поле ввода API ключа
-                    OutlinedTextField(
-                        value = apiKeyText,
-                        onValueChange = {
-                            apiKeyText = it
-                            viewModel.setOpenCodeApiKey(it, uiState.providerType)
-                        },
-                        label = {
-                            Text("API-ключ ${uiState.providerType.displayName}")
-                        },
-                        placeholder = {
-                            Text(
-                                when (uiState.providerType) {
-                                    LLMProviderType.DEEPSEEK -> "sk-..."
-                                    LLMProviderType.OPENROUTER -> "sk-or-v1-..."
-                                    LLMProviderType.GROQ -> "gsk_..."
-                                    LLMProviderType.OPENCODE_ZEN -> "sk-..."
-                                    LLMProviderType.OPENCODE_GO -> "sk-..."
-                                    else -> "sk-..."
+                    // Защищённое хранилище API-ключа: после сохранения ключ скрыт и зашифрован!
+                    if (uiState.hasCurrentApiKey && !isEditingKey) {
+                        Surface(
+                            color = Color(0xFF2E7D32).copy(alpha = 0.10f),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Color(0xFF2E7D32).copy(alpha = 0.35f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "🔒 Ключ зашифрован и скрыт",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = Color(0xFF2E7D32)
+                                    )
+                                    Text(
+                                        text = uiState.currentKeyMask,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
-                            )
-                        },
-                        singleLine = true,
-                        visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            TextButton(onClick = { showApiKey = !showApiKey }) {
-                                Text(if (showApiKey) "Скрыть" else "Показать", fontSize = 10.sp)
+                                Text(
+                                    text = "Хранится в AES-256-GCM (Android Keystore). Просмотр исходного ключа отключён для защиты от утечки.",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            apiKeyDraft = ""
+                                            isEditingKey = true
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Text("🔄 Заменить ключ", fontSize = 11.sp)
+                                    }
+                                    TextButton(
+                                        onClick = {
+                                            viewModel.deleteProviderApiKey(provider)
+                                            apiKeyDraft = ""
+                                            isEditingKey = true
+                                            Toast.makeText(context, "Ключ удалён", Toast.LENGTH_SHORT).show()
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("🗑️ Удалить", fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+                                    }
+                                }
                             }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(10.dp)
-                    )
+                        }
+                    } else {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedTextField(
+                                value = apiKeyDraft,
+                                onValueChange = { apiKeyDraft = it },
+                                label = {
+                                    Text(
+                                        if (provider.requiresApiKey) "Новый API-ключ ${provider.displayName}"
+                                        else "API-ключ (опционально)"
+                                    )
+                                },
+                                placeholder = { Text(provider.keyPlaceholder) },
+                                singleLine = true,
+                                visualTransformation = PasswordVisualTransformation(),
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Button(
+                                    onClick = { saveDraftIfPresent() },
+                                    enabled = apiKeyDraft.isNotBlank(),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Text("🔒 Зашифровать и сохранить", fontSize = 11.sp)
+                                }
+                                if (uiState.hasCurrentApiKey) {
+                                    TextButton(
+                                        onClick = {
+                                            apiKeyDraft = ""
+                                            isEditingKey = false
+                                        }
+                                    ) {
+                                        Text("Отмена", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Выбор модели из каталога
+                    val canFetchModels = !uiState.isFetchingModels && (
+                        uiState.hasCurrentApiKey ||
+                            (provider == LLMProviderType.CUSTOM_OPENAI && uiState.customBaseUrl.isNotBlank())
+                        )
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -895,7 +1195,7 @@ fun ProviderSettingsDialog(
                         )
                         TextButton(
                             onClick = { viewModel.fetchRemoteModels() },
-                            enabled = !uiState.isFetchingModels && uiState.currentApiKey.isNotBlank()
+                            enabled = canFetchModels
                         ) {
                             Text(if (uiState.isFetchingModels) "Загрузка..." else "🔄 Обновить", fontSize = 11.sp)
                         }
@@ -905,13 +1205,13 @@ fun ProviderSettingsDialog(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(max = 220.dp)
+                            .heightIn(max = 200.dp)
                             .verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(2.dp)
                     ) {
                         uiState.openCodeAvailableModels.forEach { modelName ->
                             val isSelected = modelName == uiState.openCodeSelectedModel
-                            val isFree = OpenCodeClient.isFreeModel(uiState.providerType, modelName)
+                            val isFree = OpenCodeClient.isFreeModel(provider, modelName)
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -938,8 +1238,8 @@ fun ProviderSettingsDialog(
                                 )
                                 val badgeText = when {
                                     isFree -> "Free"
-                                    uiState.providerType == LLMProviderType.DEEPSEEK && modelName == "deepseek-chat" -> "V3"
-                                    uiState.providerType == LLMProviderType.DEEPSEEK && modelName == "deepseek-reasoner" -> "R1"
+                                    provider == LLMProviderType.DEEPSEEK && modelName == "deepseek-chat" -> "V3"
+                                    provider == LLMProviderType.DEEPSEEK && modelName == "deepseek-reasoner" -> "R1"
                                     else -> null
                                 }
                                 if (badgeText != null) {
@@ -972,22 +1272,17 @@ fun ProviderSettingsDialog(
                         shape = RoundedCornerShape(10.dp)
                     )
 
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = when (uiState.providerType) {
-                            LLMProviderType.DEEPSEEK -> "💡 deepseek-chat — быстрая DeepSeek V3; deepseek-reasoner — DeepSeek R1 с автоматическим сворачиванием блока рассуждений 💭."
-                            LLMProviderType.OPENROUTER -> "💡 Модели с плашкой Free (суффикс :free) полностью бесплатны на OpenRouter без пополнения счета."
-                            LLMProviderType.GROQ -> "💡 В Groq Cloud все модели предоставляются с высоким бесплатным лимитом (до 30 запросов в минуту)."
-                            LLMProviderType.OPENCODE_ZEN -> "💡 Для платного аккаунта Zen рекомендуются: qwen3.6-plus, qwen3.8-flash, claude-3-7-sonnet, gpt-4o. Промо-модели Free предназначены для анонимного CLI."
-                            LLMProviderType.OPENCODE_GO -> "💡 Модели доступны при наличии активной подписки OpenCode GO."
-                            else -> ""
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    if (provider.tip.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = provider.tip,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 } else {
                     Text(
-                        text = "В офлайн-режиме модель выполняется локально на процессоре Helio G99 смартфона без подключения к интернету.",
+                        text = provider.description,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -995,7 +1290,12 @@ fun ProviderSettingsDialog(
             }
         },
         confirmButton = {
-            Button(onClick = onDismiss) {
+            Button(
+                onClick = {
+                    saveDraftIfPresent()
+                    onDismiss()
+                }
+            ) {
                 Text("Готово")
             }
         }
@@ -1005,6 +1305,7 @@ fun ProviderSettingsDialog(
 @Composable
 fun ChatMessageBubble(
     message: ChatMessage,
+    showThinking: Boolean = true,
     onCopyClick: () -> Unit,
     onRollbackClick: () -> Unit = {}
 ) {
@@ -1083,8 +1384,8 @@ fun ChatMessageBubble(
                     }
                 }
 
-                // Блок размышлений модели (DeepSeek-R1 / QwQ)
-                if (!isUser && parsed.thinkingText != null) {
+                // Блок размышлений модели (скрывается при выключенном режиме размышления)
+                if (showThinking && !isUser && parsed.thinkingText != null) {
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1140,9 +1441,9 @@ fun ChatMessageBubble(
                 }
 
                 // Текст сообщения
-                if (displayAnswer.isNotEmpty() || (!parsed.isStillThinking && !parsed.isPreparingToolCall && parsed.agentStepsText == null)) {
+                if (displayAnswer.isNotEmpty() || (!(showThinking && parsed.isStillThinking) && !parsed.isPreparingToolCall && parsed.agentStepsText == null)) {
                     SelectionContainer {
-                        val showCursor = message.isStreaming && displayAnswer.isEmpty() && !parsed.isStillThinking && !parsed.isPreparingToolCall
+                        val showCursor = message.isStreaming && displayAnswer.isEmpty() && !(showThinking && parsed.isStillThinking) && !parsed.isPreparingToolCall
                         Text(
                             text = if (showCursor) "▌" else displayAnswer,
                             style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 21.sp),
@@ -1723,22 +2024,143 @@ fun QuickPromptChips(
 }
 
 @Composable
+fun QueuedFollowUpsCard(
+    queue: List<QueuedFollowUp>,
+    isGenerating: Boolean,
+    onEditItem: (String) -> Unit,
+    onRemoveItem: (String) -> Unit,
+    onClearQueue: () -> Unit,
+    onSendNextNow: () -> Unit
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.55f),
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.35f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (isGenerating) {
+                        "🕒 В очереди (${queue.size}) — отправится после ответа"
+                    } else {
+                        "🕒 В очереди (${queue.size})"
+                    },
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.weight(1f)
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (!isGenerating) {
+                        Text(
+                            text = "▶ Отправить",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .clickable { onSendNextNow() }
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                        )
+                    }
+                    Text(
+                        text = "Очистить",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier
+                            .clickable { onClearQueue() }
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
+            queue.forEachIndexed { idx, item ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                            RoundedCornerShape(6.dp)
+                        )
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val attBadge = item.attachedDoc?.let { "${it.category.emoji} " } ?: ""
+                    Text(
+                        text = "${idx + 1}. $attBadge${item.text.replace("\n", " ")}",
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "✎",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier
+                            .clickable { onEditItem(item.id) }
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    )
+                    Text(
+                        text = "✕",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier
+                            .clickable { onRemoveItem(item.id) }
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun ChatInputBar(
     uiState: UiState,
     onInputTextChange: (String) -> Unit,
     onSendClick: () -> Unit,
+    onEnqueueClick: () -> Unit,
     onStopClick: () -> Unit,
     onAttachFileClick: () -> Unit,
-    onRemoveAttachmentClick: () -> Unit
+    onRemoveAttachmentClick: () -> Unit,
+    onEditQueuedItem: (String) -> Unit,
+    onRemoveQueuedItem: (String) -> Unit,
+    onClearQueue: () -> Unit,
+    onSendNextQueuedNow: () -> Unit
 ) {
     val isReady = uiState.isReadyToChat
     val attached = uiState.attachedDoc
+    val hasDraft = uiState.inputText.isNotBlank() || attached != null
 
     Surface(
         tonalElevation = 2.dp,
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
+            // Очередь дополнений (отправляются строго после завершения текущего ответа)
+            if (uiState.queuedFollowUps.isNotEmpty()) {
+                QueuedFollowUpsCard(
+                    queue = uiState.queuedFollowUps,
+                    isGenerating = uiState.isGenerating,
+                    onEditItem = onEditQueuedItem,
+                    onRemoveItem = onRemoveQueuedItem,
+                    onClearQueue = onClearQueue,
+                    onSendNextNow = onSendNextQueuedNow
+                )
+            }
+
             // Превью прикреплённого файла любого формата (с миниатюрой для скриншотов/фото/PDF/видео)
             if (attached != null) {
                 val previewBitmap = remember(attached.imageBase64) {
@@ -1749,8 +2171,7 @@ fun ChatInputBar(
                         } catch (_: Exception) { null }
                     }
                 }
-                val isTextOnlyProvider = uiState.providerType == LLMProviderType.LOCAL_GGUF ||
-                    uiState.providerType == LLMProviderType.DEEPSEEK
+                val isTextOnlyProvider = !uiState.providerType.supportsVision
 
                 Surface(
                     color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f),
@@ -1822,7 +2243,7 @@ fun ChatInputBar(
                         if (attached.imageBase64 != null && isTextOnlyProvider) {
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "ℹ️ ${uiState.providerType.displayName} работает в текстовом режиме (будут переданы метаданные). Для визуального анализа выберите Vision-модель (OpenRouter / Zen / Go).",
+                                text = "ℹ️ ${uiState.providerType.displayName} работает в текстовом режиме (будут переданы метаданные). Для визуального анализа выберите Vision-провайдер (Gemini / OpenRouter / Groq / OpenAI / Claude).",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = Color(0xFFB45309),
                                 lineHeight = 14.sp
@@ -1839,10 +2260,10 @@ fun ChatInputBar(
                 verticalAlignment = Alignment.Bottom,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                // Кнопка скрепки (прикрепление файлов любых форматов)
+                // Кнопка скрепки остаётся активной даже во время ответа (можно прикрепить файл к дополнению в очередь!)
                 IconButton(
                     onClick = onAttachFileClick,
-                    enabled = isReady && !uiState.isGenerating,
+                    enabled = isReady,
                     modifier = Modifier
                         .size(44.dp)
                         .align(Alignment.CenterVertically)
@@ -1854,28 +2275,54 @@ fun ChatInputBar(
                     )
                 }
 
+                // Поле ввода НЕ блокируется при генерации — можно спокойно дописывать дополнение в очередь!
                 OutlinedTextField(
                     value = uiState.inputText,
                     onValueChange = onInputTextChange,
                     placeholder = {
                         Text(
-                            if (isReady) "Сообщение или прикрепите любой файл..."
-                            else if (uiState.providerType == LLMProviderType.LOCAL_GGUF) "Сначала выберите модель GGUF..."
-                            else "Укажите API-ключ ${uiState.providerType.displayName}..."
+                            when {
+                                !isReady && uiState.providerType == LLMProviderType.LOCAL_GGUF -> "Сначала выберите модель GGUF..."
+                                !isReady && uiState.providerType == LLMProviderType.CUSTOM_OPENAI -> "Укажите Base URL в настройках..."
+                                !isReady -> "Укажите API-ключ ${uiState.providerType.displayName}..."
+                                uiState.isGenerating -> "Дополнить вопрос (встанет в очередь)..."
+                                else -> "Сообщение, /скилл или файл..."
+                            }
                         )
                     },
                     modifier = Modifier
                         .weight(1f)
                         .heightIn(min = 52.dp, max = 130.dp),
                     shape = RoundedCornerShape(22.dp),
-                    enabled = isReady && !uiState.isGenerating
+                    enabled = isReady
                 )
 
                 if (uiState.isGenerating) {
+                    // Кнопка постановки дополнения в очередь (не перебивает текущий ответ!)
+                    IconButton(
+                        onClick = onEnqueueClick,
+                        enabled = isReady && hasDraft,
+                        modifier = Modifier
+                            .size(44.dp)
+                            .background(
+                                if (isReady && hasDraft) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.surfaceVariant,
+                                CircleShape
+                            )
+                    ) {
+                        Text(
+                            text = "🕒",
+                            fontSize = 17.sp,
+                            color = if (isReady && hasDraft) MaterialTheme.colorScheme.onPrimary
+                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                        )
+                    }
+
+                    // Кнопка остановки текущей генерации
                     IconButton(
                         onClick = onStopClick,
                         modifier = Modifier
-                            .size(48.dp)
+                            .size(44.dp)
                             .background(MaterialTheme.colorScheme.errorContainer, CircleShape)
                     ) {
                         Icon(
@@ -1887,11 +2334,11 @@ fun ChatInputBar(
                 } else {
                     IconButton(
                         onClick = onSendClick,
-                        enabled = isReady && (uiState.inputText.isNotBlank() || uiState.attachedDoc != null),
+                        enabled = isReady && hasDraft,
                         modifier = Modifier
                             .size(48.dp)
                             .background(
-                                if (isReady && (uiState.inputText.isNotBlank() || uiState.attachedDoc != null))
+                                if (isReady && hasDraft)
                                     MaterialTheme.colorScheme.primary
                                 else
                                     MaterialTheme.colorScheme.surfaceVariant,
@@ -1901,7 +2348,7 @@ fun ChatInputBar(
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = "Отправить",
-                            tint = if (isReady && (uiState.inputText.isNotBlank() || uiState.attachedDoc != null))
+                            tint = if (isReady && hasDraft)
                                 MaterialTheme.colorScheme.onPrimary
                             else
                                 MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)

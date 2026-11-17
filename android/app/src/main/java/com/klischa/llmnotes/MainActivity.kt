@@ -62,6 +62,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Лаунчер импорта локального SKILL.md / .txt файла в библиотеку скиллов
+    private val openSkillFileLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let { targetUri ->
+            viewModel.importSkillFromUri(targetUri) { _, msg ->
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     // Запрос разрешений на чтение медиа (фото/видео) для Device Tools
     private val requestMediaPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -115,6 +126,9 @@ class MainActivity : ComponentActivity() {
                     },
                     onAttachFileClick = {
                         openAttachmentLauncher.launch(arrayOf("*/*"))
+                    },
+                    onImportSkillFileClick = {
+                        openSkillFileLauncher.launch(arrayOf("text/*", "application/octet-stream", "*/*"))
                     },
                     onRequestTermuxPermissionClick = {
                         requestTermuxPermission()

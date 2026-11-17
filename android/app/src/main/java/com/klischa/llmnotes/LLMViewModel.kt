@@ -12,6 +12,7 @@ import androidx.lifecycle.viewModelScope
 import com.klischa.llmnotes.api.ApiChatMessage
 import com.klischa.llmnotes.api.LLMProviderType
 import com.klischa.llmnotes.api.OpenCodeClient
+import com.klischa.llmnotes.security.SecureKeyStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
@@ -73,6 +75,13 @@ data class AttachedDoc(
     val summaryBadge: String = ""
 )
 
+data class QueuedFollowUp(
+    val id: String = UUID.randomUUID().toString(),
+    val text: String,
+    val attachedDoc: AttachedDoc? = null,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
 data class UiState(
     val isModelLoaded: Boolean = false,
     val isLoadingModel: Boolean = false,
@@ -84,15 +93,24 @@ data class UiState(
     val currentChatId: String = "",
     val chatSessions: List<com.klischa.llmnotes.data.ChatSession> = emptyList(),
     val providerType: LLMProviderType = LLMProviderType.LOCAL_GGUF,
-    val deepSeekApiKey: String = "",
-    val openCodeGoApiKey: String = "",
-    val openCodeZenApiKey: String = "",
-    val openRouterApiKey: String = "",
-    val groqApiKey: String = "",
-    val openCodeSelectedModel: String = "qwen3.6-plus",
-    val openCodeAvailableModels: List<String> = OpenCodeClient.ZEN_DEFAULT_MODELS,
+    // Только замаскированные отпечатки сохранённых ключей (открытые ключи НИКОГДА не хранятся в UiState)
+    val savedKeyMasks: Map<LLMProviderType, String> = emptyMap(),
+    val customBaseUrl: String = "",
+    val openCodeSelectedModel: String = OpenCodeClient.getDefaultModel(LLMProviderType.OPENROUTER),
+    val openCodeAvailableModels: List<String> = OpenCodeClient.OPENROUTER_DEFAULT_MODELS,
     val isProviderDialogVisible: Boolean = false,
     val isFetchingModels: Boolean = false,
+    // Переключатель режима размышления (Thinking / <think>)
+    val thinkingEnabled: Boolean = true,
+    // Скиллы (Agent Skills / SKILL.md)
+    val skills: List<AgentSkill> = emptyList(),
+    val isSkillsDialogVisible: Boolean = false,
+    val remoteSkillsCatalog: List<RemoteSkillEntry> = SkillManager.CURATED_REMOTE_SKILLS,
+    val isFetchingSkill: Boolean = false,
+    val isFetchingSkillCatalog: Boolean = false,
+    val skillStatusMessage: String = "",
+    // Очередь дополнений во время генерации ответа (не перебивает текущий ответ)
+    val queuedFollowUps: List<QueuedFollowUp> = emptyList(),
     val systemPrompt: String = SystemPromptPreset.UNIVERSAL.prompt,
     val isSystemPromptExpanded: Boolean = false,
     val statusMessage: String = "Выберите модель GGUF в памяти смартфона",
@@ -113,18 +131,21 @@ data class UiState(
     val pendingToolApproval: PendingToolApproval? = null,
     val activeToolStatus: String? = null
 ) {
-    val currentApiKey: String
-        get() = when (providerType) {
-            LLMProviderType.DEEPSEEK -> deepSeekApiKey
-            LLMProviderType.OPENROUTER -> openRouterApiKey
-            LLMProviderType.GROQ -> groqApiKey
-            LLMProviderType.OPENCODE_GO -> openCodeGoApiKey
-            LLMProviderType.OPENCODE_ZEN -> openCodeZenApiKey
-            LLMProviderType.LOCAL_GGUF -> ""
-        }
+    val currentKeyMask: String
+        get() = savedKeyMasks[providerType].orEmpty()
+
+    val hasCurrentApiKey: Boolean
+        get() = currentKeyMask.isNotEmpty()
+
+    val activeSkillsCount: Int
+        get() = skills.count { it.enabled }
 
     val isReadyToChat: Boolean
-        get() = if (providerType == LLMProviderType.LOCAL_GGUF) isModelLoaded else currentApiKey.isNotBlank()
+        get() = when (providerType) {
+            LLMProviderType.LOCAL_GGUF -> isModelLoaded
+            LLMProviderType.CUSTOM_OPENAI -> customBaseUrl.isNotBlank()
+            else -> hasCurrentApiKey
+        }
 }
 
 class LLMViewModel(application: Application) : AndroidViewModel(application) {
@@ -157,17 +178,13 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREF_LAST_MODEL_NAME = "last_model_name"
         private const val PREF_AUTO_LOAD_ENABLED = "auto_load_enabled"
         private const val PREF_PROVIDER_TYPE = "provider_type"
-        private const val PREF_DEEPSEEK_KEY = "deepseek_key"
         private const val PREF_DEEPSEEK_MODEL = "deepseek_model"
-        private const val PREF_OPENCODE_API_KEY = "opencode_api_key"
-        private const val PREF_OPENCODE_GO_KEY = "opencode_go_key"
-        private const val PREF_OPENCODE_ZEN_KEY = "opencode_zen_key"
-        private const val PREF_OPENROUTER_KEY = "openrouter_key"
-        private const val PREF_GROQ_KEY = "groq_key"
         private const val PREF_OPENCODE_MODEL_GO = "opencode_model_go"
         private const val PREF_OPENCODE_MODEL_ZEN = "opencode_model_zen"
         private const val PREF_OPENROUTER_MODEL = "openrouter_model"
         private const val PREF_GROQ_MODEL = "groq_model"
+        private const val PREF_CUSTOM_BASE_URL = "custom_openai_base_url"
+        private const val PREF_THINKING_ENABLED = "thinking_enabled"
         private const val PREF_AGENT_MODE_ENABLED = "agent_mode_enabled"
         private const val PREF_AGENT_CONFIRM_MODE = "agent_confirm_mode"
     }
@@ -261,8 +278,14 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             LLMProviderType.LOCAL_GGUF ->
                 if (state.isModelLoaded) "Модель готова: ${state.modelPath}"
                 else "Выберите модель GGUF в памяти смартфона"
+            LLMProviderType.CUSTOM_OPENAI ->
+                if (state.customBaseUrl.isNotBlank()) {
+                    "Свой API готов (${state.openCodeSelectedModel.ifBlank { "укажите модель" }})"
+                } else {
+                    "Укажите Base URL для своего OpenAI API"
+                }
             else ->
-                if (state.currentApiKey.isNotBlank()) {
+                if (state.hasCurrentApiKey) {
                     "${state.providerType.displayName} готов (${state.openCodeSelectedModel})"
                 } else {
                     "Укажите API-ключ для ${state.providerType.displayName}"
@@ -270,37 +293,43 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun modelPrefKeyFor(provider: LLMProviderType): String {
+        return when (provider) {
+            LLMProviderType.DEEPSEEK -> PREF_DEEPSEEK_MODEL
+            LLMProviderType.OPENROUTER -> PREF_OPENROUTER_MODEL
+            LLMProviderType.GROQ -> PREF_GROQ_MODEL
+            LLMProviderType.OPENCODE_ZEN -> PREF_OPENCODE_MODEL_ZEN
+            LLMProviderType.OPENCODE_GO -> PREF_OPENCODE_MODEL_GO
+            LLMProviderType.LOCAL_GGUF -> ""
+            else -> "model_${provider.name}"
+        }
+    }
+
+    private fun getSavedModelForProvider(prefs: android.content.SharedPreferences, provider: LLMProviderType): String {
+        if (provider == LLMProviderType.LOCAL_GGUF) return ""
+        val key = modelPrefKeyFor(provider)
+        val fallback = OpenCodeClient.getDefaultModel(provider)
+        return prefs.getString(key, null)?.takeIf { it.isNotBlank() } ?: fallback
+    }
+
     private fun initProviderSettings() {
-        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val app = getApplication<Application>()
+        // Переносим прежние открытые API-ключи в зашифрованный Android Keystore и удаляем plaintext
+        SecureKeyStore.migrateLegacyPlaintextKeys(app)
+        val keyMasks = SecureKeyStore.getAllKeyMasks(app)
+
+        val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val providerStr = prefs.getString(PREF_PROVIDER_TYPE, LLMProviderType.LOCAL_GGUF.name)
         val provider = try {
             LLMProviderType.valueOf(providerStr ?: "")
         } catch (_: Exception) {
             LLMProviderType.LOCAL_GGUF
         }
-        val keyDeepSeek = prefs.getString(PREF_DEEPSEEK_KEY, "") ?: ""
-        val keyGo = prefs.getString(PREF_OPENCODE_GO_KEY, null)
-            ?: prefs.getString(PREF_OPENCODE_API_KEY, "") ?: ""
-        val keyZen = prefs.getString(PREF_OPENCODE_ZEN_KEY, null)
-            ?: prefs.getString(PREF_OPENCODE_API_KEY, "") ?: ""
-        val keyOpenRouter = prefs.getString(PREF_OPENROUTER_KEY, "") ?: ""
-        val keyGroq = prefs.getString(PREF_GROQ_KEY, "") ?: ""
-
-        val modelDeepSeek = prefs.getString(PREF_DEEPSEEK_MODEL, "deepseek-chat") ?: "deepseek-chat"
-        val modelGo = prefs.getString(PREF_OPENCODE_MODEL_GO, "deepseek-v4-pro") ?: "deepseek-v4-pro"
-        val modelZen = prefs.getString(PREF_OPENCODE_MODEL_ZEN, "qwen3.6-plus") ?: "qwen3.6-plus"
-        val modelOpenRouter = prefs.getString(PREF_OPENROUTER_MODEL, "google/gemini-2.0-flash-exp:free") ?: "google/gemini-2.0-flash-exp:free"
-        val modelGroq = prefs.getString(PREF_GROQ_MODEL, "llama-3.3-70b-versatile") ?: "llama-3.3-70b-versatile"
-
-        val selectedModel = when (provider) {
-            LLMProviderType.DEEPSEEK -> modelDeepSeek
-            LLMProviderType.OPENROUTER -> modelOpenRouter
-            LLMProviderType.GROQ -> modelGroq
-            LLMProviderType.OPENCODE_ZEN -> modelZen
-            LLMProviderType.OPENCODE_GO -> modelGo
-            LLMProviderType.LOCAL_GGUF -> ""
-        }
+        val customBaseUrl = prefs.getString(PREF_CUSTOM_BASE_URL, "") ?: ""
+        val thinkingEnabled = prefs.getBoolean(PREF_THINKING_ENABLED, true)
+        val selectedModel = getSavedModelForProvider(prefs, provider)
         val models = OpenCodeClient.getDefaultModels(provider)
+        val loadedSkills = SkillManager.loadSkills(app)
 
         val agentEnabled = prefs.getBoolean(PREF_AGENT_MODE_ENABLED, true)
         val confirmStr = prefs.getString(PREF_AGENT_CONFIRM_MODE, AgentConfirmationMode.CONFIRM_DESTRUCTIVE.name)
@@ -309,23 +338,295 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) {
             AgentConfirmationMode.CONFIRM_DESTRUCTIVE
         }
-        val termuxStatus = TermuxBridge.checkStatus(getApplication())
+        val termuxStatus = TermuxBridge.checkStatus(app)
 
         _uiState.update { current ->
             val updated = current.copy(
                 providerType = provider,
-                deepSeekApiKey = keyDeepSeek,
-                openCodeGoApiKey = keyGo,
-                openCodeZenApiKey = keyZen,
-                openRouterApiKey = keyOpenRouter,
-                groqApiKey = keyGroq,
+                savedKeyMasks = keyMasks,
+                customBaseUrl = customBaseUrl,
                 openCodeSelectedModel = selectedModel,
                 openCodeAvailableModels = models,
+                thinkingEnabled = thinkingEnabled,
+                skills = loadedSkills,
                 agentModeEnabled = agentEnabled,
                 agentConfirmationMode = confirmMode,
                 termuxStatus = termuxStatus
             )
             updated.copy(statusMessage = buildIdleStatus(updated))
+        }
+    }
+
+    fun setThinkingEnabled(enabled: Boolean) {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(PREF_THINKING_ENABLED, enabled).apply()
+        _uiState.update {
+            it.copy(
+                thinkingEnabled = enabled,
+                statusMessage = if (enabled) {
+                    "💭 Режим размышления включён"
+                } else {
+                    "⚡ Режим размышления отключён (быстрые прямые ответы)"
+                }
+            )
+        }
+    }
+
+    fun toggleThinkingEnabled() {
+        setThinkingEnabled(!_uiState.value.thinkingEnabled)
+    }
+
+    // ==================== Скиллы (Skills / SKILL.md) ====================
+
+    fun setSkillsDialogVisible(visible: Boolean) {
+        _uiState.update { it.copy(isSkillsDialogVisible = visible, skillStatusMessage = "") }
+        if (visible && _uiState.value.remoteSkillsCatalog.size <= SkillManager.CURATED_REMOTE_SKILLS.size) {
+            refreshOnlineSkillsCatalog()
+        }
+    }
+
+    fun toggleSkillEnabled(skillId: String, enabled: Boolean) {
+        val updated = _uiState.value.skills.map { s ->
+            if (s.id == skillId) s.copy(enabled = enabled) else s
+        }
+        SkillManager.saveSkills(getApplication(), updated)
+        val count = updated.count { it.enabled }
+        _uiState.update {
+            it.copy(
+                skills = updated,
+                statusMessage = if (count > 0) "🧩 Активных скиллов: $count" else "Скиллы отключены"
+            )
+        }
+    }
+
+    fun deleteSkill(skillId: String) {
+        val target = _uiState.value.skills.find { it.id == skillId } ?: return
+        if (target.source == "builtin") return
+        val updated = _uiState.value.skills.filterNot { it.id == skillId }
+        SkillManager.saveSkills(getApplication(), updated)
+        _uiState.update {
+            it.copy(
+                skills = updated,
+                skillStatusMessage = "Скилл «${target.name}» удалён"
+            )
+        }
+    }
+
+    fun saveCustomSkill(
+        existingId: String?,
+        name: String,
+        slug: String,
+        description: String,
+        instructions: String
+    ) {
+        val cleanName = name.trim()
+        val cleanInstr = instructions.trim()
+        if (cleanName.isBlank() || cleanInstr.isBlank()) return
+        val cleanSlug = SkillManager.toSlug(slug.ifBlank { cleanName })
+        val cleanDesc = description.trim().ifBlank { cleanInstr.lineSequence().firstOrNull()?.take(120).orEmpty() }
+
+        val current = _uiState.value.skills
+        val updated = if (existingId != null && current.any { it.id == existingId }) {
+            current.map { s ->
+                if (s.id == existingId) {
+                    s.copy(
+                        name = cleanName,
+                        slug = cleanSlug,
+                        description = cleanDesc,
+                        instructions = cleanInstr,
+                        updatedAt = System.currentTimeMillis()
+                    )
+                } else s
+            }
+        } else {
+            val created = AgentSkill(
+                id = "custom_${UUID.randomUUID().toString().take(8)}",
+                name = cleanName,
+                slug = cleanSlug,
+                description = cleanDesc,
+                instructions = cleanInstr,
+                source = "custom",
+                enabled = true,
+                updatedAt = System.currentTimeMillis()
+            )
+            current + created
+        }
+
+        SkillManager.saveSkills(getApplication(), updated)
+        _uiState.update {
+            it.copy(
+                skills = updated,
+                skillStatusMessage = "✅ Скилл «$cleanName» сохранён и включён"
+            )
+        }
+    }
+
+    fun installSkillFromUrl(url: String, onDone: (Boolean, String) -> Unit = { _, _ -> }) {
+        if (_uiState.value.isFetchingSkill) return
+        _uiState.update { it.copy(isFetchingSkill = true, skillStatusMessage = "Загрузка SKILL.md...") }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val installed = SkillManager.fetchSkillFromUrl(url)
+                val current = _uiState.value.skills
+                // Если скилл с таким же sourceUrl или slug (не встроенный) уже есть — обновляем его
+                val existingIdx = current.indexOfFirst {
+                    it.source != "builtin" && (
+                        (!installed.sourceUrl.isNullOrBlank() && it.sourceUrl == installed.sourceUrl) ||
+                            it.slug.equals(installed.slug, ignoreCase = true)
+                        )
+                }
+                val updated = if (existingIdx >= 0) {
+                    current.toMutableList().apply {
+                        this[existingIdx] = installed.copy(id = current[existingIdx].id)
+                    }
+                } else {
+                    current + installed
+                }
+                SkillManager.saveSkills(getApplication(), updated)
+                val msg = "✅ Скилл «${installed.name}» (/${installed.slug}) установлен и включён"
+                _uiState.update {
+                    it.copy(
+                        skills = updated,
+                        isFetchingSkill = false,
+                        skillStatusMessage = msg,
+                        statusMessage = msg
+                    )
+                }
+                withContext(Dispatchers.Main) { onDone(true, msg) }
+            } catch (e: Exception) {
+                val err = "⚠️ Ошибка загрузки скилла: ${e.message ?: "проверьте ссылку"}"
+                _uiState.update {
+                    it.copy(
+                        isFetchingSkill = false,
+                        skillStatusMessage = err
+                    )
+                }
+                withContext(Dispatchers.Main) { onDone(false, err) }
+            }
+        }
+    }
+
+    fun importSkillFromUri(uri: Uri, onDone: (Boolean, String) -> Unit = { _, _ -> }) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val (displayName, _) = queryUriMetadata(getApplication<Application>().contentResolver, uri)
+                val imported = SkillManager.importSkillFromUri(getApplication(), uri, displayName)
+                val updated = _uiState.value.skills + imported
+                SkillManager.saveSkills(getApplication(), updated)
+                val msg = "✅ Импортирован скилл «${imported.name}» (/${imported.slug})"
+                _uiState.update {
+                    it.copy(
+                        skills = updated,
+                        skillStatusMessage = msg,
+                        statusMessage = msg
+                    )
+                }
+                withContext(Dispatchers.Main) { onDone(true, msg) }
+            } catch (e: Exception) {
+                val err = "⚠️ Не удалось импортировать файл: ${e.message}"
+                _uiState.update { it.copy(skillStatusMessage = err) }
+                withContext(Dispatchers.Main) { onDone(false, err) }
+            }
+        }
+    }
+
+    fun refreshOnlineSkillsCatalog() {
+        if (_uiState.value.isFetchingSkillCatalog) return
+        _uiState.update { it.copy(isFetchingSkillCatalog = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val catalog = SkillManager.fetchOnlineCatalog()
+            _uiState.update {
+                it.copy(
+                    remoteSkillsCatalog = catalog,
+                    isFetchingSkillCatalog = false
+                )
+            }
+        }
+    }
+
+    // ==================== Очередь дополнений во время генерации ====================
+
+    fun enqueueFollowUp(userText: String = _uiState.value.inputText) {
+        val state = _uiState.value
+        val attached = state.attachedDoc
+        val cleanText = userText.trim()
+        if (cleanText.isEmpty() && attached == null) return
+
+        val finalText = cleanText.ifEmpty {
+            when (attached?.category) {
+                AttachmentCategory.IMAGE -> "Дополнение: опиши и проанализируй изображение (${attached.name})"
+                AttachmentCategory.PDF -> "Дополнение: проанализируй PDF (${attached.name})"
+                else -> "Дополнение: проанализируй прикреплённый файл (${attached?.name ?: "файл"})"
+            }
+        }
+        val item = QueuedFollowUp(text = finalText, attachedDoc = attached)
+        _uiState.update { current ->
+            val newQueue = current.queuedFollowUps + item
+            current.copy(
+                inputText = "",
+                attachedDoc = null,
+                queuedFollowUps = newQueue,
+                statusMessage = "🕒 Дополнение в очереди (${newQueue.size}) — отправится после текущего ответа"
+            )
+        }
+    }
+
+    fun removeQueuedFollowUp(id: String) {
+        _uiState.update { current ->
+            val newQueue = current.queuedFollowUps.filterNot { it.id == id }
+            current.copy(
+                queuedFollowUps = newQueue,
+                statusMessage = if (newQueue.isEmpty() && !current.isGenerating) buildIdleStatus(current) else current.statusMessage
+            )
+        }
+    }
+
+    fun editQueuedFollowUp(id: String) {
+        val target = _uiState.value.queuedFollowUps.find { it.id == id } ?: return
+        _uiState.update { current ->
+            val mergedInput = if (current.inputText.isBlank()) target.text else "${current.inputText.trim()}\n${target.text}"
+            current.copy(
+                inputText = mergedInput,
+                attachedDoc = target.attachedDoc ?: current.attachedDoc,
+                queuedFollowUps = current.queuedFollowUps.filterNot { it.id == id }
+            )
+        }
+    }
+
+    fun clearQueuedFollowUps() {
+        _uiState.update { current ->
+            current.copy(
+                queuedFollowUps = emptyList(),
+                statusMessage = if (!current.isGenerating) buildIdleStatus(current) else current.statusMessage
+            )
+        }
+    }
+
+    fun sendNextQueuedNow() {
+        val state = _uiState.value
+        if (state.isGenerating || state.queuedFollowUps.isEmpty()) return
+        val next = state.queuedFollowUps.first()
+        _uiState.update { it.copy(queuedFollowUps = it.queuedFollowUps.drop(1)) }
+        sendMessage(
+            userText = next.text,
+            explicitAttachment = next.attachedDoc,
+            useCurrentUiAttachment = false
+        )
+    }
+
+    private fun dispatchNextQueuedFollowUp(expectedChatId: String) {
+        viewModelScope.launch(Dispatchers.Main) {
+            val state = _uiState.value
+            if (state.isGenerating) return@launch
+            if (state.currentChatId != expectedChatId) return@launch
+            if (state.queuedFollowUps.isEmpty()) return@launch
+            val next = state.queuedFollowUps.first()
+            _uiState.update { it.copy(queuedFollowUps = it.queuedFollowUps.drop(1)) }
+            sendMessage(
+                userText = next.text,
+                explicitAttachment = next.attachedDoc,
+                useCurrentUiAttachment = false
+            )
         }
     }
 
@@ -407,14 +708,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putString(PREF_PROVIDER_TYPE, type.name).apply()
 
-        val selectedModel = when (type) {
-            LLMProviderType.DEEPSEEK -> prefs.getString(PREF_DEEPSEEK_MODEL, "deepseek-chat") ?: "deepseek-chat"
-            LLMProviderType.OPENROUTER -> prefs.getString(PREF_OPENROUTER_MODEL, "google/gemini-2.0-flash-exp:free") ?: "google/gemini-2.0-flash-exp:free"
-            LLMProviderType.GROQ -> prefs.getString(PREF_GROQ_MODEL, "llama-3.3-70b-versatile") ?: "llama-3.3-70b-versatile"
-            LLMProviderType.OPENCODE_GO -> prefs.getString(PREF_OPENCODE_MODEL_GO, "deepseek-v4-pro") ?: "deepseek-v4-pro"
-            LLMProviderType.OPENCODE_ZEN -> prefs.getString(PREF_OPENCODE_MODEL_ZEN, "qwen3.6-plus") ?: "qwen3.6-plus"
-            LLMProviderType.LOCAL_GGUF -> ""
-        }
+        val selectedModel = getSavedModelForProvider(prefs, type)
         val defaultModels = OpenCodeClient.getDefaultModels(type)
 
         _uiState.update { current ->
@@ -428,51 +722,66 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
         if (type == LLMProviderType.LOCAL_GGUF) {
             tryAutoLoadLastModel()
-        } else if (_uiState.value.currentApiKey.isNotBlank()) {
+        } else if (_uiState.value.hasCurrentApiKey || (type == LLMProviderType.CUSTOM_OPENAI && _uiState.value.customBaseUrl.isNotBlank())) {
             fetchRemoteModels()
         }
     }
 
-    fun setOpenCodeApiKey(key: String, provider: LLMProviderType = _uiState.value.providerType) {
-        val cleanKey = key.trim()
-        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        when (provider) {
-            LLMProviderType.DEEPSEEK -> {
-                prefs.edit().putString(PREF_DEEPSEEK_KEY, cleanKey).apply()
-                _uiState.update { it.copy(deepSeekApiKey = cleanKey) }
-            }
-            LLMProviderType.OPENROUTER -> {
-                prefs.edit().putString(PREF_OPENROUTER_KEY, cleanKey).apply()
-                _uiState.update { it.copy(openRouterApiKey = cleanKey) }
-            }
-            LLMProviderType.GROQ -> {
-                prefs.edit().putString(PREF_GROQ_KEY, cleanKey).apply()
-                _uiState.update { it.copy(groqApiKey = cleanKey) }
-            }
-            LLMProviderType.OPENCODE_ZEN -> {
-                prefs.edit().putString(PREF_OPENCODE_ZEN_KEY, cleanKey).apply()
-                _uiState.update { it.copy(openCodeZenApiKey = cleanKey) }
-            }
-            LLMProviderType.OPENCODE_GO -> {
-                prefs.edit().putString(PREF_OPENCODE_GO_KEY, cleanKey).apply()
-                _uiState.update { it.copy(openCodeGoApiKey = cleanKey) }
-            }
-            LLMProviderType.LOCAL_GGUF -> {}
+    /**
+     * Шифрует API-ключ в Android Keystore (SecureKeyStore) и сохраняет в UiState ТОЛЬКО маску.
+     */
+    fun saveProviderApiKey(rawKey: String, provider: LLMProviderType = _uiState.value.providerType) {
+        if (provider == LLMProviderType.LOCAL_GGUF) return
+        val cleanKey = rawKey.trim()
+        val app = getApplication<Application>()
+        if (cleanKey.isEmpty()) {
+            SecureKeyStore.deleteKey(app, provider)
+        } else {
+            SecureKeyStore.saveKey(app, provider, cleanKey)
         }
-        // Обновляем статус без лишнего сетевого запроса на каждое нажатие клавиши
-        _uiState.update { current -> current.copy(statusMessage = buildIdleStatus(current)) }
+        val mask = SecureKeyStore.getKeyMask(app, provider)
+        _uiState.update { current ->
+            val updatedMasks = if (mask.isEmpty()) {
+                current.savedKeyMasks - provider
+            } else {
+                current.savedKeyMasks + (provider to mask)
+            }
+            val updated = current.copy(savedKeyMasks = updatedMasks)
+            updated.copy(
+                statusMessage = if (mask.isNotEmpty()) {
+                    "🔒 API-ключ ${provider.displayName} зашифрован и сохранён"
+                } else {
+                    buildIdleStatus(updated)
+                }
+            )
+        }
+        if (cleanKey.isNotEmpty() && provider == _uiState.value.providerType) {
+            fetchRemoteModels()
+        }
+    }
+
+    fun deleteProviderApiKey(provider: LLMProviderType = _uiState.value.providerType) {
+        if (provider == LLMProviderType.LOCAL_GGUF) return
+        SecureKeyStore.deleteKey(getApplication(), provider)
+        _uiState.update { current ->
+            val updated = current.copy(savedKeyMasks = current.savedKeyMasks - provider)
+            updated.copy(statusMessage = "API-ключ ${provider.displayName} удалён")
+        }
+    }
+
+    fun setCustomBaseUrl(url: String) {
+        val clean = url.trim()
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(PREF_CUSTOM_BASE_URL, clean).apply()
+        _uiState.update { current ->
+            val updated = current.copy(customBaseUrl = clean)
+            updated.copy(statusMessage = buildIdleStatus(updated))
+        }
     }
 
     fun setOpenCodeSelectedModel(model: String) {
         val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val key = when (_uiState.value.providerType) {
-            LLMProviderType.DEEPSEEK -> PREF_DEEPSEEK_MODEL
-            LLMProviderType.OPENROUTER -> PREF_OPENROUTER_MODEL
-            LLMProviderType.GROQ -> PREF_GROQ_MODEL
-            LLMProviderType.OPENCODE_ZEN -> PREF_OPENCODE_MODEL_ZEN
-            LLMProviderType.OPENCODE_GO -> PREF_OPENCODE_MODEL_GO
-            LLMProviderType.LOCAL_GGUF -> ""
-        }
+        val key = modelPrefKeyFor(_uiState.value.providerType)
         if (key.isNotEmpty()) {
             prefs.edit().putString(key, model).apply()
         }
@@ -485,13 +794,17 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun fetchRemoteModels() {
-        val provider = _uiState.value.providerType
-        val apiKey = _uiState.value.currentApiKey
-        if (provider == LLMProviderType.LOCAL_GGUF || apiKey.isBlank()) return
+        val state = _uiState.value
+        val provider = state.providerType
+        if (provider == LLMProviderType.LOCAL_GGUF) return
+        if (provider.requiresApiKey && !state.hasCurrentApiKey) return
+        if (provider == LLMProviderType.CUSTOM_OPENAI && state.customBaseUrl.isBlank()) return
 
+        val customUrl = state.customBaseUrl
         viewModelScope.launch(Dispatchers.IO) {
             _uiState.update { it.copy(isFetchingModels = true) }
-            val models = OpenCodeClient.fetchModels(provider, apiKey)
+            val decryptedKey = SecureKeyStore.getKey(getApplication(), provider)
+            val models = OpenCodeClient.fetchModels(provider, decryptedKey, customUrl)
             _uiState.update {
                 it.copy(
                     isFetchingModels = false,
@@ -542,6 +855,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 currentChatId = newId,
                 chatSessions = updatedList,
                 messages = emptyList(),
+                queuedFollowUps = emptyList(),
                 statusMessage = if (it.isReadyToChat) "Новый диалог создан" else buildIdleStatus(it)
             )
         }
@@ -557,13 +871,15 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 currentChatId = chatId,
                 messages = msgs,
+                queuedFollowUps = emptyList(),
                 statusMessage = if (it.isReadyToChat) "Диалог загружен" else buildIdleStatus(it)
             )
         }
     }
 
     fun deleteChat(chatId: String) {
-        if (_uiState.value.isGenerating && chatId == _uiState.value.currentChatId) {
+        val wasActive = chatId == _uiState.value.currentChatId
+        if (_uiState.value.isGenerating && wasActive) {
             stopGeneration()
         }
         dbHelper.deleteSession(chatId)
@@ -577,7 +893,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 it.copy(
                     currentChatId = nextSession.id,
                     chatSessions = sessions,
-                    messages = msgs
+                    messages = msgs,
+                    queuedFollowUps = if (wasActive) emptyList() else it.queuedFollowUps
                 )
             }
         }
@@ -923,14 +1240,25 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Отправка сообщения в чат с сохранением многошаговой истории диалога (Multi-turn chat).
-     * Поддерживает как локальный инференс (LlamaBridge / GGUF), так и облачные API
-     * (DeepSeek API, OpenRouter, Groq Cloud, OpenCode ZEN/GO).
+     * Если модель уже генерирует ответ — безопасно ставит дополнение в очередь (`enqueueFollowUp`),
+     * не перебивая текущее сообщение.
      */
-    fun sendMessage(userText: String = _uiState.value.inputText) {
+    fun sendMessage(
+        userText: String = _uiState.value.inputText,
+        explicitAttachment: AttachedDoc? = null,
+        useCurrentUiAttachment: Boolean = true
+    ) {
         val stateSnapshot = _uiState.value
-        val attached = stateSnapshot.attachedDoc
+        if (stateSnapshot.isGenerating) {
+            if (useCurrentUiAttachment) {
+                enqueueFollowUp(userText)
+            }
+            return
+        }
+
+        val attached = explicitAttachment ?: if (useCurrentUiAttachment) stateSnapshot.attachedDoc else null
         val rawPrompt = userText.trim()
-        if ((rawPrompt.isEmpty() && attached == null) || stateSnapshot.isGenerating) return
+        if (rawPrompt.isEmpty() && attached == null) return
 
         val prompt = rawPrompt.ifEmpty {
             when (attached?.category) {
@@ -942,7 +1270,16 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
         val isLocal = stateSnapshot.providerType == LLMProviderType.LOCAL_GGUF
         if (isLocal && !stateSnapshot.isModelLoaded) return
-        if (!isLocal && stateSnapshot.currentApiKey.isBlank()) {
+        if (stateSnapshot.providerType == LLMProviderType.CUSTOM_OPENAI && stateSnapshot.customBaseUrl.isBlank()) {
+            _uiState.update {
+                it.copy(
+                    statusMessage = "Укажите Base URL для своего OpenAI API",
+                    isProviderDialogVisible = true
+                )
+            }
+            return
+        }
+        if (!isLocal && stateSnapshot.providerType.requiresApiKey && !stateSnapshot.hasCurrentApiKey) {
             _uiState.update {
                 it.copy(
                     statusMessage = "Укажите API-ключ для ${stateSnapshot.providerType.displayName}",
@@ -974,18 +1311,20 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         val assistantMsgId = assistantMessage.id
         val existingChatId = stateSnapshot.currentChatId
         val activeProvider = stateSnapshot.providerType
-        val activeApiKey = stateSnapshot.currentApiKey
+        val activeCustomBaseUrl = stateSnapshot.customBaseUrl
         val activeRemoteModel = stateSnapshot.openCodeSelectedModel
         val activeTemperature = stateSnapshot.temperature
         val activeTopP = stateSnapshot.topP
         val baseSysPrompt = stateSnapshot.systemPrompt.trim()
         val agentEnabled = stateSnapshot.agentModeEnabled
         val activeConfirmMode = stateSnapshot.agentConfirmationMode
+        val activeThinkingEnabled = stateSnapshot.thinkingEnabled
+        val activeSkillsSnapshot = stateSnapshot.skills
 
         _uiState.update {
             it.copy(
-                inputText = "",
-                attachedDoc = null,
+                inputText = if (useCurrentUiAttachment) "" else it.inputText,
+                attachedDoc = if (useCurrentUiAttachment) null else it.attachedDoc,
                 messages = updatedMessages,
                 isGenerating = true,
                 pendingToolApproval = null,
@@ -1001,9 +1340,11 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         val myEpoch = generationEpoch.incrementAndGet()
         fun isActiveEpoch(): Boolean = generationEpoch.get() == myEpoch
 
-        // Вся работа с БД, файлами, телеметрией, Termux и сетью/инференсом — в фоновом потоке
+        // Вся работа с БД, расшифровкой ключа, файлами, телеметрией, Termux и сетью/инференсом — в фоновом потоке
         generationJob = viewModelScope.launch(Dispatchers.IO) {
             if (!isActiveEpoch()) return@launch
+
+            val activeApiKey = if (!isLocal) SecureKeyStore.getKey(getApplication(), activeProvider) else ""
 
             val currentChatId = existingChatId.ifBlank {
                 val newId = UUID.randomUUID().toString()
@@ -1034,8 +1375,15 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             val rolesList = mutableListOf<String>()
             val contentsList = mutableListOf<String>()
 
-            // 1. Системный промпт + телеметрия устройства + инструкции режима агента (файлы и Termux)
-            val telemetryContext = if (DeviceTools.isDeviceQuery(prompt)) {
+            // 1. Системный промпт + активные скиллы + телеметрия устройства + инструкции агента + директива размышлений
+            val resolvedSkills = SkillManager.resolveSkillsForPrompt(
+                allSkills = activeSkillsSnapshot,
+                userPrompt = prompt,
+                isLocalCompact = isLocal
+            )
+            val effectiveUserPromptText = resolvedSkills.cleanedPrompt
+
+            val telemetryContext = if (DeviceTools.isDeviceQuery(effectiveUserPromptText)) {
                 try {
                     DeviceTools.buildTelemetryContext(getApplication())
                 } catch (e: Exception) {
@@ -1056,7 +1404,19 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 ""
             }
 
-            val effectiveSysPrompt = listOf(baseSysPrompt, telemetryContext, agentPrompt)
+            val thinkingDirective = if (!activeThinkingEnabled) {
+                "Режим размышления отключён пользователем. Отвечай сразу по существу без промежуточных рассуждений и без блоков <think>. /no_think"
+            } else {
+                ""
+            }
+
+            val effectiveSysPrompt = listOf(
+                baseSysPrompt,
+                resolvedSkills.systemBlock,
+                telemetryContext,
+                agentPrompt,
+                thinkingDirective
+            )
                 .filter { it.isNotBlank() }
                 .joinToString("\n\n")
 
@@ -1096,7 +1456,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             } else ""
 
             val (enrichedPrompt, loadedLocalFiles, localImages) =
-                FileStorageManager.enrichPromptWithLocalFilesAndImages(getApplication(), prompt)
+                FileStorageManager.enrichPromptWithLocalFilesAndImages(getApplication(), effectiveUserPromptText)
             currentImageDataUrls.addAll(localImages)
             val finalUserPromptForModel = filePrefix + enrichedPrompt
 
@@ -1143,6 +1503,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                             messages = apiMessages,
                             conversationId = currentChatId,
                             temperature = activeTemperature,
+                            customBaseUrl = activeCustomBaseUrl,
+                            thinkingEnabled = activeThinkingEnabled,
                             onToken = { tokenPiece ->
                                 if (!isRemoteCancelled && isActiveEpoch()) {
                                     totalTokens++
@@ -1246,6 +1608,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                                     messages = apiMessages,
                                     conversationId = currentChatId,
                                     temperature = activeTemperature,
+                                    customBaseUrl = activeCustomBaseUrl,
+                                    thinkingEnabled = activeThinkingEnabled,
                                     onToken = { piece ->
                                         if (!isRemoteCancelled && isActiveEpoch()) {
                                             totalTokens++
@@ -1374,6 +1738,11 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                             widgetAnswer,
                             "${activeProvider.displayName} • $activeRemoteModel"
                         )
+                    }
+
+                    // Если во время ответа пользователь поставил дополнение в очередь — отправляем его строго ПОСЛЕ завершения текущего ответа
+                    if (!wasCancelled && isActiveEpoch()) {
+                        dispatchNextQueuedFollowUp(currentChatId)
                     }
                 } catch (e: Exception) {
                     if (!isActiveEpoch()) return@launch
@@ -1570,6 +1939,10 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     "Офлайн GGUF • ${_uiState.value.modelPath}"
                 )
             }
+
+            if (!wasCancelled && isActiveEpoch()) {
+                dispatchNextQueuedFollowUp(currentChatId)
+            }
         }
     }
 
@@ -1710,6 +2083,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 messages = remaining,
                 chatSessions = refreshedSessions,
                 inputText = restoredPrompt,
+                queuedFollowUps = emptyList(),
                 isGenerating = false,
                 pendingToolApproval = null,
                 activeToolStatus = null,
@@ -1743,6 +2117,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 it.copy(
                     chatSessions = refreshed,
                     messages = emptyList(),
+                    queuedFollowUps = emptyList(),
                     statusMessage = if (it.isReadyToChat) "Диалог очищен" else buildIdleStatus(it)
                 )
             }
@@ -1750,6 +2125,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update {
                 it.copy(
                     messages = emptyList(),
+                    queuedFollowUps = emptyList(),
                     statusMessage = if (it.isReadyToChat) "Диалог очищен" else buildIdleStatus(it)
                 )
             }
