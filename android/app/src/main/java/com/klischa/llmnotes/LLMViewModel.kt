@@ -1536,6 +1536,15 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 ""
             }
 
+            val availableMcpTools = if (agentEnabled && !activePlanOnlyMode) {
+                try { McpManager.listTools(getApplication()) } catch (e: Exception) {
+                    Log.w(TAG, "MCP discovery failed: ${e.message}")
+                    emptyList()
+                }
+            } else emptyList()
+
+            val mcpPrompt = McpManager.promptForTools(availableMcpTools)
+
             val thinkingDirective = if (!activeThinkingEnabled) {
                 "Режим размышления отключён пользователем. Отвечай сразу по существу без промежуточных рассуждений и без блоков <think>. /no_think"
             } else {
@@ -1547,6 +1556,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 resolvedSkills.systemBlock,
                 telemetryContext,
                 agentPrompt,
+                mcpPrompt,
                 if (activePlanOnlyMode) "РЕЖИМ ПЛАНА (READ-ONLY): ничего не изменяй и не выполняй действия. Не вызывай инструменты и не открывай/редактируй файлы или сайты. Только проанализируй задачу и выдай пошаговый план, риски и ожидаемые результаты. Выполнение возможно только после явного переключения пользователя в режим Direct." else "РЕЖИМ DIRECT: пользователь разрешил выполнять действия согласно настройкам агента и запрашивать предусмотренные подтверждения.",
                 thinkingDirective
             )

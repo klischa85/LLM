@@ -2594,6 +2594,7 @@ fun AgentSettingsDialog(
         Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
     }
     val termux = uiState.termuxStatus
+    var showMcpSettings by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2630,6 +2631,14 @@ fun AgentSettingsDialog(
                         checked = uiState.agentModeEnabled,
                         onCheckedChange = { viewModel.setAgentModeEnabled(it) }
                     )
+                }
+
+                OutlinedButton(
+                    onClick = { showMcpSettings = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("🔌 Подключения MCP…")
                 }
 
                 HorizontalDivider()
@@ -2878,4 +2887,8 @@ fun AgentSettingsDialog(
             }
         }
     )
+
+    if (showMcpSettings) {
+        McpSettingsDialog(onDismiss = { showMcpSettings = false })
+    }
 }

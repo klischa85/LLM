@@ -57,7 +57,7 @@ class ModelDownloader(private val context: Context) {
             connectTimeout = 20_000
             readTimeout = 30_000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "LLMNotes-Android/1.4.1")
+            setRequestProperty("User-Agent", "LLMNotes-Android/1.4.2")
             if (rangeStart > 0L) {
                 setRequestProperty("Range", "bytes=$rangeStart-")
             }

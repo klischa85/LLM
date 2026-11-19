@@ -15,7 +15,7 @@ import java.util.Locale
 enum class AgentConfirmationMode(val title: String, val subtitle: String) {
     CONFIRM_DESTRUCTIVE(
         "Подтверждать опасные",
-        "Чтение, поиск и навигация — сразу; удаление, правка, перезапись, Termux, ввод в формы, опасные клики и JS — по кнопке"
+        "Чтение и поиск — сразу; изменения, Termux, опасные браузерные действия и MCP без readOnlyHint — по кнопке"
     ),
     CONFIRM_ALL(
         "Подтверждать все изменения",
@@ -23,7 +23,7 @@ enum class AgentConfirmationMode(val title: String, val subtitle: String) {
     ),
     AUTO(
         "Автоматически",
-        "Выполнять все операции с файлами, браузером и Termux без пауз на подтверждение"
+        "Операции файлов, браузера и Termux — без пауз; MCP-вызовы без readOnlyHint всё равно требуют отдельного подтверждения"
     )
 }
 
@@ -629,6 +629,14 @@ object AgentTools {
      * Определяет, требуется ли подтверждение пользователя перед выполнением данного инструмента.
      */
     fun needsConfirmation(call: AgentToolCall, mode: AgentConfirmationMode): Boolean {
+        // MCP has its explicit policy: declared read-only tools run directly; every other tool asks first,
+        // including when the general-purpose agent policy is AUTO.
+        if (call.tool == "mcp_call") {
+            if (mode == AgentConfirmationMode.CONFIRM_ALL) return true
+            val serverId = call.args.optString("server_id")
+            val toolName = call.args.optString("tool")
+            return !McpManager.isReadOnly(serverId, toolName)
+        }
         if (mode == AgentConfirmationMode.AUTO) return false
 
         val isReadOnly = call.tool in setOf(
@@ -742,6 +750,19 @@ object AgentTools {
                     isHighRisk = false
                 )
             }
+            "mcp_call" -> {
+                val serverId = call.args.optString("server_id", "")
+                val toolName = call.args.optString("tool", "")
+                val args = call.args.optJSONObject("arguments") ?: JSONObject()
+                PendingToolApproval(
+                    call = call,
+                    title = "Вызов MCP-инструмента",
+                    riskLabel = if (McpManager.isReadOnly(serverId, toolName)) "🔎 MCP: чтение" else "⚠️ MCP: изменение данных — требуется подтверждение",
+                    targetDisplay = "$serverId / $toolName",
+                    detailPreview = args.toString(2).take(1800),
+                    isHighRisk = !McpManager.isReadOnly(serverId, toolName)
+                )
+            }
             "run_termux" -> {
                 val cmd = call.args.optString("command", "")
                 val workdir = call.args.optString("workdir", storageRootCanonical()).ifBlank { storageRootCanonical() }
@@ -825,6 +846,7 @@ object AgentTools {
                 "move_file" -> execMoveFile(context, call.args)
                 "delete_file" -> execDeleteFile(context, call.args)
                 "run_termux" -> execRunTermux(context, call.args)
+                "mcp_call" -> execMcpCall(context, call.args)
                 "browser_search" -> execBrowserSearch(context, call.args)
                 "browser_open" -> execBrowserOpen(context, call.args)
                 "browser_read" -> execBrowserRead(context, call.args)
@@ -838,7 +860,7 @@ object AgentTools {
                     tool = call.tool,
                     ok = false,
                     summary = "Неизвестный инструмент '${call.tool}'",
-                    output = "Ошибка: инструмент '${call.tool}' не существует. Доступные: list_dir, read_file, search_files, file_info, mkdir, write_file, edit_file, move_file, delete_file, run_termux, browser_search, browser_open, browser_read, browser_click, browser_type, browser_scroll, browser_back, browser_screenshot, browser_eval_js."
+                    output = "Ошибка: инструмент '${call.tool}' не существует. Доступные: list_dir, read_file, search_files, file_info, mkdir, write_file, edit_file, move_file, delete_file, run_termux, browser_search, browser_open, browser_read, browser_click, browser_type, browser_scroll, browser_back, browser_screenshot, browser_eval_js, mcp_call."
                 )
             }
         } catch (e: Exception) {
@@ -850,6 +872,16 @@ object AgentTools {
                 output = "Ошибка при выполнении ${call.tool}: ${e.message}"
             )
         }
+    }
+
+    private suspend fun execMcpCall(context: Context, args: JSONObject): AgentToolResult {
+        val serverId = args.optString("server_id", "").trim()
+        val toolName = args.optString("tool", "").trim()
+        if (serverId.isBlank() || toolName.isBlank()) {
+            return AgentToolResult("mcp_call", false, "MCP: не заданы сервер или инструмент", "Нужны аргументы server_id, tool и arguments.")
+        }
+        val call = McpManager.callTool(context, serverId, toolName, args.optJSONObject("arguments") ?: JSONObject())
+        return AgentToolResult("mcp_call", call.ok, "MCP ${if (call.ok) "выполнено" else "ошибка"}: $toolName", call.text)
     }
 
     // =========================================================================

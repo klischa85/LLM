@@ -134,6 +134,21 @@ object SecureKeyStore {
         return hasKeyInternal(appCtx, provider)
     }
 
+    /** Stores arbitrary app secrets encrypted with the same Android Keystore AES-GCM key. */
+    @Synchronized
+    fun saveSecret(context: Context, key: String, value: String) {
+        val prefs = context.applicationContext.getSharedPreferences(SECURE_PREFS_NAME, Context.MODE_PRIVATE)
+        if (value.isBlank()) prefs.edit().remove("secret_$key").commit()
+        else prefs.edit().putString("secret_$key", encrypt(context.applicationContext, value.trim())).commit()
+    }
+
+    @Synchronized
+    fun getSecret(context: Context, key: String): String {
+        val stored = context.applicationContext.getSharedPreferences(SECURE_PREFS_NAME, Context.MODE_PRIVATE)
+            .getString("secret_$key", null) ?: return ""
+        return decrypt(context.applicationContext, stored).orEmpty()
+    }
+
     /**
      * Возвращает безопасную замаскированную строку для показа в UI (например `sk-••••••••a9f3`),
      * либо пустую строку, если ключ не задан.
