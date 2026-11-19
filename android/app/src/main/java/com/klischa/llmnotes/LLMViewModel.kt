@@ -123,6 +123,8 @@ data class UiState(
     val threadCount: Int = 2, // Оптимум 2 ядра Cortex-A76 для Helio G99
     val temperature: Float = 0.6f,
     val topP: Float = 0.9f,
+    // Режим агента: PLAN формирует только план и никогда не запускает инструменты; DIRECT выполняет действия.
+    val planOnlyMode: Boolean = false,
     // Режим агента (работа с файлами устройства, встроенным браузером и Termux RUN_COMMAND)
     val agentModeEnabled: Boolean = true,
     val agentConfirmationMode: AgentConfirmationMode = AgentConfirmationMode.CONFIRM_DESTRUCTIVE,
@@ -190,6 +192,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREF_GROQ_MODEL = "groq_model"
         private const val PREF_CUSTOM_BASE_URL = "custom_openai_base_url"
         private const val PREF_THINKING_ENABLED = "thinking_enabled"
+        private const val PREF_PLAN_ONLY_MODE = "plan_only_mode"
         private const val PREF_AGENT_MODE_ENABLED = "agent_mode_enabled"
         private const val PREF_AGENT_CONFIRM_MODE = "agent_confirm_mode"
         private const val PREF_BROWSER_SEARCH_ENGINE = "browser_search_engine"
@@ -334,6 +337,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         }
         val customBaseUrl = prefs.getString(PREF_CUSTOM_BASE_URL, "") ?: ""
         val thinkingEnabled = prefs.getBoolean(PREF_THINKING_ENABLED, true)
+        val planOnlyMode = prefs.getBoolean(PREF_PLAN_ONLY_MODE, false)
         val selectedModel = getSavedModelForProvider(prefs, provider)
         val models = OpenCodeClient.getDefaultModels(provider)
         val loadedSkills = SkillManager.loadSkills(app)
@@ -360,6 +364,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 openCodeSelectedModel = selectedModel,
                 openCodeAvailableModels = models,
                 thinkingEnabled = thinkingEnabled,
+                planOnlyMode = planOnlyMode,
                 skills = loadedSkills,
                 agentModeEnabled = agentEnabled,
                 agentConfirmationMode = confirmMode,
@@ -487,6 +492,19 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleThinkingEnabled() {
         setThinkingEnabled(!_uiState.value.thinkingEnabled)
+    }
+
+    fun setPlanOnlyMode(enabled: Boolean) {
+        getApplication<Application>()
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_PLAN_ONLY_MODE, enabled)
+            .apply()
+        _uiState.update { it.copy(planOnlyMode = enabled) }
+    }
+
+    fun togglePlanOnlyMode() {
+        setPlanOnlyMode(!_uiState.value.planOnlyMode)
     }
 
     // ==================== Скиллы (Skills / SKILL.md) ====================
@@ -1430,6 +1448,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         val activeTopP = stateSnapshot.topP
         val baseSysPrompt = stateSnapshot.systemPrompt.trim()
         val agentEnabled = stateSnapshot.agentModeEnabled
+        val activePlanOnlyMode = stateSnapshot.planOnlyMode
         val activeConfirmMode = stateSnapshot.agentConfirmationMode
         val activeThinkingEnabled = stateSnapshot.thinkingEnabled
         val activeSkillsSnapshot = stateSnapshot.skills
@@ -1528,6 +1547,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 resolvedSkills.systemBlock,
                 telemetryContext,
                 agentPrompt,
+                if (activePlanOnlyMode) "РЕЖИМ ПЛАНА (READ-ONLY): ничего не изменяй и не выполняй действия. Не вызывай инструменты и не открывай/редактируй файлы или сайты. Только проанализируй задачу и выдай пошаговый план, риски и ожидаемые результаты. Выполнение возможно только после явного переключения пользователя в режим Direct." else "РЕЖИМ DIRECT: пользователь разрешил выполнять действия согласно настройкам агента и запрашивать предусмотренные подтверждения.",
                 thinkingDirective
             )
                 .filter { it.isNotBlank() }
@@ -1655,14 +1675,14 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                             stepRaw
                         }
 
-                        val extraction = if (agentEnabled && !isRemoteCancelled) {
+                        val extraction = if (agentEnabled && !activePlanOnlyMode && !isRemoteCancelled) {
                             AgentTools.extractToolCallsDetailed(stepRaw)
                         } else {
                             ToolCallExtraction(emptyList())
                         }
                         val toolCalls = when {
                             extraction.calls.isNotEmpty() -> extraction.calls
-                            agentEnabled && !isRemoteCancelled && streamRes.nativeToolCalls.isNotEmpty() -> streamRes.nativeToolCalls
+                            agentEnabled && !activePlanOnlyMode && !isRemoteCancelled && streamRes.nativeToolCalls.isNotEmpty() -> streamRes.nativeToolCalls
                             else -> emptyList()
                         }
 
@@ -1947,7 +1967,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 val stepRaw = ThoughtParser.cleanStopTokens(stepBuilder.toString())
                 finalStepText = stepRaw
 
-                val extraction = if (agentEnabled && !isLocalCancelled) {
+                val extraction = if (agentEnabled && !activePlanOnlyMode && !isLocalCancelled) {
                     AgentTools.extractToolCallsDetailed(stepRaw)
                 } else {
                     ToolCallExtraction(emptyList())

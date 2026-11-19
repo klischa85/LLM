@@ -429,6 +429,7 @@ fun ChatScreen(
                     uiState = uiState,
                     browserState = browserState,
                     onToggleThinking = { viewModel.toggleThinkingEnabled() },
+                    onTogglePlanOnly = { viewModel.togglePlanOnlyMode() },
                     onOpenSkills = { viewModel.setSkillsDialogVisible(true) },
                     onOpenBrowser = { viewModel.setBrowserVisible(true) },
                     onOpenProviders = { viewModel.setProviderDialogVisible(true) },
@@ -671,6 +672,7 @@ fun QuickControlsBar(
     uiState: UiState,
     browserState: BrowserUiState,
     onToggleThinking: () -> Unit,
+    onTogglePlanOnly: () -> Unit,
     onOpenSkills: () -> Unit,
     onOpenBrowser: () -> Unit,
     onOpenProviders: () -> Unit,
@@ -691,6 +693,18 @@ fun QuickControlsBar(
             label = {
                 Text(
                     text = if (uiState.thinkingEnabled) "💭 Размышления: Вкл" else "⚡ Размышления: Выкл",
+                    fontSize = 11.sp
+                )
+            }
+        )
+
+        // Безопасное планирование без инструментов/изменений, либо исполнение в Direct.
+        FilterChip(
+            selected = uiState.planOnlyMode,
+            onClick = onTogglePlanOnly,
+            label = {
+                Text(
+                    text = if (uiState.planOnlyMode) "📝 План: только чтение" else "⚡ Direct: выполнять",
                     fontSize = 11.sp
                 )
             }
@@ -1374,7 +1388,8 @@ fun ChatMessageBubble(
     }
 
     val displayAnswer = parsed.answerText
-    var isThoughtExpanded by remember(message.id) { mutableStateOf(false) }
+    // Рассуждения остаются видимыми и после завершения ответа; пользователь может свернуть вручную.
+    var isThoughtExpanded by remember(message.id) { mutableStateOf(true) }
 
     val codeBlocks = remember(displayAnswer) {
         if (!isUser) FileStorageManager.extractCodeBlocks(displayAnswer) else emptyList()
@@ -1651,9 +1666,10 @@ fun AgentStepsSection(
     steps: List<AgentStepLog>,
     isStreaming: Boolean
 ) {
-    var isSectionExpanded by remember(messageId) { mutableStateOf(false) }
+    // Начальное развёрнутое состояние можно переключить в любой момент, в том числе во время генерации.
+    var isSectionExpanded by remember(messageId) { mutableStateOf(true) }
     val expandedSteps = remember(messageId) { mutableStateMapOf<Int, Boolean>() }
-    val showList = isSectionExpanded || isStreaming
+    val showList = isSectionExpanded
 
     val okCount = remember(steps) { steps.count { it.status == "ok" } }
     val errCount = remember(steps) { steps.count { it.status == "error" } }
