@@ -10,7 +10,8 @@ data class AgentStepLog(
     val summary: String,
     val argsPreview: String = "",
     val output: String = "",
-    val durationMs: Long = 0L
+    val durationMs: Long = 0L,
+    val reasoning: String = ""
 )
 
 data class ParsedMessage(
@@ -96,6 +97,7 @@ object ThoughtParser {
                 if (step.argsPreview.isNotBlank()) put("a", step.argsPreview)
                 if (step.output.isNotBlank()) put("o", step.output)
                 if (step.durationMs > 0L) put("d", step.durationMs)
+                if (step.reasoning.isNotBlank()) put("r", step.reasoning)
             })
         }
         val safeJson = arr.toString().replace("</agent_steps_json>", "<\\/agent_steps_json>")
@@ -116,7 +118,8 @@ object ThoughtParser {
                         summary = obj.optString("m", ""),
                         argsPreview = obj.optString("a", ""),
                         output = obj.optString("o", ""),
-                        durationMs = obj.optLong("d", 0L)
+                        durationMs = obj.optLong("d", 0L),
+                        reasoning = obj.optString("r", "")
                     )
                 )
             }

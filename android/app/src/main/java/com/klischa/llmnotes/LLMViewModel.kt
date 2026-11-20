@@ -1695,6 +1695,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                         }
 
                         if (toolCalls.isNotEmpty()) {
+                            val stepReasoning = ThoughtParser.parse(stepRaw, isStreaming = false).thinkingText.orEmpty()
                             consecutiveRecoveries = 0
                             accumulatedAnswerParts = StringBuilder()
 
@@ -1705,6 +1706,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                                     confirmMode = activeConfirmMode,
                                     agentSteps = agentSteps,
                                     assistantMsgId = assistantMsgId,
+                                    reasoningText = stepReasoning,
                                     isCancelled = { isRemoteCancelled || !isActiveEpoch() }
                                 )
                                 if (isRemoteCancelled || !isActiveEpoch()) break
@@ -1983,6 +1985,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 val toolCalls = extraction.calls
 
                 if (toolCalls.isNotEmpty()) {
+                    val stepReasoning = ThoughtParser.parse(stepRaw, isStreaming = false).thinkingText.orEmpty()
                     localConsecutiveRecoveries = 0
                     if (step == maxSteps) break
 
@@ -1991,6 +1994,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                         confirmMode = activeConfirmMode,
                         agentSteps = agentSteps,
                         assistantMsgId = assistantMsgId,
+                        reasoningText = stepReasoning,
                         isCancelled = { isLocalCancelled || !isActiveEpoch() }
                     )
                     if (isLocalCancelled || !isActiveEpoch()) break
@@ -2103,6 +2107,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         confirmMode: AgentConfirmationMode,
         agentSteps: MutableList<AgentStepLog>,
         assistantMsgId: String,
+        reasoningText: String,
         isCancelled: () -> Boolean
     ): ToolBatchResult {
         val observations = StringBuilder()
@@ -2139,7 +2144,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                             summary = "Отклонено: ${approval.title} ($shortTarget)",
                             argsPreview = argsDisplay,
                             output = "Операция отклонена пользователем.",
-                            durationMs = 0L
+                            durationMs = 0L,
+                            reasoning = reasoningText
                         )
                     )
                     updateAssistantStepsPreview(assistantMsgId, agentSteps)
@@ -2174,7 +2180,8 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                     summary = res.summary,
                     argsPreview = argsDisplay,
                     output = res.output.take(4000),
-                    durationMs = elapsedMs
+                    durationMs = elapsedMs,
+                    reasoning = reasoningText
                 )
             )
             updateAssistantStepsPreview(assistantMsgId, agentSteps)

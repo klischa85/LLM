@@ -162,10 +162,11 @@ fun ChatScreen(
         )
     }
 
-    // Автоматическая прокрутка к последнему сообщению при получении новых токенов
+    // Следуем за нижним краем растущего сообщения, а не за его началом.
+    // Это сохраняет последнюю строку ответа/рассуждения в поле зрения во время стриминга.
     LaunchedEffect(uiState.messages.size, uiState.messages.lastOrNull()?.text) {
         if (uiState.messages.isNotEmpty()) {
-            listState.animateScrollToItem(uiState.messages.size - 1)
+            listState.scrollToItem(uiState.messages.size - 1, scrollOffset = Int.MAX_VALUE)
         }
     }
 
@@ -1674,7 +1675,7 @@ fun AgentStepsSection(
     val okCount = remember(steps) { steps.count { it.status == "ok" } }
     val errCount = remember(steps) { steps.count { it.status == "error" } }
     val deniedCount = remember(steps) { steps.count { it.status == "denied" } }
-    val hasAnyDetails = remember(steps) { steps.any { it.argsPreview.isNotBlank() || it.output.isNotBlank() } }
+    val hasAnyDetails = remember(steps) { steps.any { it.argsPreview.isNotBlank() || it.output.isNotBlank() || it.reasoning.isNotBlank() } }
 
     Card(
         modifier = Modifier
@@ -1731,7 +1732,7 @@ fun AgentStepsSection(
                     verticalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     if (steps.size > 1 && hasAnyDetails) {
-                        val allExpanded = steps.all { expandedSteps[it.index] == true }
+                        val allExpanded = steps.all { expandedSteps[it.index] ?: it.reasoning.isNotBlank() }
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.End
@@ -1752,7 +1753,7 @@ fun AgentStepsSection(
                     }
 
                     steps.forEach { step ->
-                        val isStepExpanded = expandedSteps[step.index] == true
+                        val isStepExpanded = expandedSteps[step.index] ?: step.reasoning.isNotBlank()
                         AgentStepItemCard(
                             step = step,
                             expanded = isStepExpanded,
@@ -1772,7 +1773,7 @@ private fun AgentStepItemCard(
     onToggle: () -> Unit
 ) {
     val context = LocalContext.current
-    val hasDetails = step.argsPreview.isNotBlank() || step.output.isNotBlank()
+    val hasDetails = step.argsPreview.isNotBlank() || step.output.isNotBlank() || step.reasoning.isNotBlank()
     val statusIcon = when (step.status) {
         "ok" -> "✅"
         "denied" -> "⛔"
@@ -1860,6 +1861,28 @@ private fun AgentStepItemCard(
                         .padding(top = 6.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
+                    if (step.reasoning.isNotBlank()) {
+                        Text(
+                            text = "💭 Рассуждение перед действием:",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, fontSize = 10.sp),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.28f),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            SelectionContainer {
+                                Text(
+                                    text = step.reasoning,
+                                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, lineHeight = 15.sp),
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()).padding(7.dp)
+                                )
+                            }
+                        }
+                    }
+
                     if (step.argsPreview.isNotBlank()) {
                         Text(
                             text = "Параметры:",
