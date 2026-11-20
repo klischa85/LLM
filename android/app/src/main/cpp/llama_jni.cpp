@@ -580,6 +580,11 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
     std::vector<llama_token> last_tokens;
     last_tokens.reserve(64);
 
+    // Reuse sampling storage between tokens: allocating a full vocabulary vector on every
+    // decode step caused severe allocator overhead on Android CPUs.
+    std::vector<llama_token_data> candidates;
+    candidates.reserve(n_vocab);
+
     // Цикл декодирования токенов (с защитой n_cur < n_ctx)
     while (generated_count < max_tokens && n_cur < n_ctx && !g_stop_requested.load()) {
         float * logits = llama_get_logits_ith(g_context, batch.n_tokens - 1);
@@ -588,8 +593,7 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
             break;
         }
 
-        std::vector<llama_token_data> candidates;
-        candidates.reserve(n_vocab);
+        candidates.clear();
         for (llama_token token_id = 0; token_id < n_vocab; ++token_id) {
             candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
         }
@@ -607,6 +611,10 @@ Java_com_klischa_llmnotes_LlamaBridge_nativeGenerate(
             );
         }
 
+        // Prune the vocabulary before nucleus sampling. Without top-k, top-p sorts the
+        // entire 100k+ vocabulary for every token, which can make low-end Android devices
+        // appear frozen for tens of minutes. Keep 40 candidates for quality/speed balance.
+        llama_sample_top_k(g_context, &candidates_p, 40, 1);
         llama_sample_top_p(g_context, &candidates_p, top_p, 1);
         llama_sample_temp(g_context, &candidates_p, temperature);
         llama_token new_token_id = llama_sample_token(g_context, &candidates_p);

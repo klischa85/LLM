@@ -563,3 +563,9 @@ adb push models_gguf/qwen2.5-1.5b-q4_k_m.gguf /sdcard/Download/
 
 - MCP `tools/list` discovery now runs only when the user taps **«Проверить»** in MCP settings. The discovered tool schemas and read-only hints are cached locally and reused in chat, so every offline/online chat turn no longer blocks on network calls or Termux process startup.
 - MCP server schemas are refreshed explicitly from the server settings screen; adding/removing servers invalidates the corresponding cached tool list.
+
+## 31. Офлайн-инференс на телефоне — `v1.4.4`
+
+- Ускорено сэмплирование llama.cpp на Android: перед nucleus sampling (top-p) применяется top-k=40, чтобы не сортировать весь словарь модели при генерации каждого токена.
+- Буфер кандидатов словаря теперь выделяется один раз на генерацию и повторно используется для каждого токена вместо повторных крупных выделений памяти.
+- Наиболее полезно для CPU-инференса на устройствах начального и среднего уровня; фактическая скорость зависит от модели GGUF, квантизации, числа потоков, температуры устройства и длины ответа.

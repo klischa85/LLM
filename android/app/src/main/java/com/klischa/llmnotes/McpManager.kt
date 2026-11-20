@@ -199,7 +199,7 @@ object McpManager {
         if (token.isNotBlank()) req.setRequestProperty("Authorization", "Bearer $token")
         req.outputStream.use {
             it.write(request("initialize", JSONObject().put("protocolVersion", PROTOCOL_VERSION)
-                .put("capabilities", JSONObject()).put("clientInfo", JSONObject().put("name", "LLM Notes").put("version", "1.4.3"))).toString().toByteArray())
+                .put("capabilities", JSONObject()).put("clientInfo", JSONObject().put("name", "LLM Notes").put("version", "1.4.4"))).toString().toByteArray())
         }
         val response = parseResponse(req)
         val session = req.getHeaderField("Mcp-Session-Id").orEmpty()
@@ -229,7 +229,7 @@ object McpManager {
     private suspend fun callStdio(context: Context, server: McpServer, operation: JSONObject): JSONObject {
         val (method, params) = operation.getString("method") to (operation.optJSONObject("params") ?: JSONObject())
         val init = request("initialize", JSONObject().put("protocolVersion", PROTOCOL_VERSION)
-            .put("capabilities", JSONObject()).put("clientInfo", JSONObject().put("name", "LLM Notes").put("version", "1.4.3")), 1)
+            .put("capabilities", JSONObject()).put("clientInfo", JSONObject().put("name", "LLM Notes").put("version", "1.4.4")), 1)
         val notify = JSONObject().put("jsonrpc", "2.0").put("method", "notifications/initialized")
         val actual = request(method, params, 2)
         val stdin = listOf(init, notify, actual).joinToString("\n") { it.toString() } + "\n"
