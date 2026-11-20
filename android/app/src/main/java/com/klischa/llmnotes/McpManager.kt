@@ -37,9 +37,32 @@ data class McpCallResult(val ok: Boolean, val text: String)
 object McpManager {
     private const val PREFS = "mcp_servers_v1"
     private const val LIST_KEY = "server_list"
+    private const val TOOLS_KEY = "cached_tools"
     private const val TAG = "McpManager"
     private const val PROTOCOL_VERSION = "2025-03-26"
     @Volatile private var cachedTools: List<McpTool> = emptyList()
+
+    fun getCachedTools(context: Context): List<McpTool> {
+        if (cachedTools.isNotEmpty()) return cachedTools
+        val servers = listServers(context).associateBy { it.id }
+        val raw = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(TOOLS_KEY, "[]") ?: "[]"
+        val loaded = try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).mapNotNull { i ->
+                val obj = arr.optJSONObject(i) ?: return@mapNotNull null
+                val server = servers[obj.optString("serverId")] ?: return@mapNotNull null
+                McpTool(server, obj.optString("name"), obj.optString("description"), obj.optJSONObject("schema") ?: JSONObject().put("type", "object"), obj.optBoolean("readOnly"))
+            }
+        } catch (_: Exception) { emptyList() }
+        cachedTools = loaded
+        return loaded
+    }
+
+    private fun persistTools(context: Context, tools: List<McpTool>) {
+        val arr = JSONArray()
+        tools.forEach { t -> arr.put(JSONObject().put("serverId", t.server.id).put("name", t.name).put("description", t.description).put("schema", t.inputSchema).put("readOnly", t.readOnly)) }
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(TOOLS_KEY, arr.toString()).apply()
+    }
 
     fun isReadOnly(serverId: String, toolName: String): Boolean =
         cachedTools.firstOrNull { it.server.id == serverId && it.name == toolName }?.readOnly == true
@@ -73,6 +96,7 @@ object McpManager {
 
     fun saveServer(context: Context, server: McpServer, token: String = "") {
         val app = context.applicationContext
+        val previousTools = getCachedTools(app)
         val all = listServers(app).filterNot { it.id == server.id } + server
         val arr = JSONArray()
         all.forEach { s -> arr.put(JSONObject().apply {
@@ -80,17 +104,22 @@ object McpManager {
             put("endpoint", s.endpoint); put("command", s.command); put("workdir", s.workdir); put("enabled", s.enabled)
         }) }
         app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(LIST_KEY, arr.toString()).apply()
+        cachedTools = previousTools.filterNot { it.server.id == server.id }
+        persistTools(app, cachedTools)
         SecureKeyStore.saveSecret(app, tokenKey(server.id), token)
     }
 
     fun deleteServer(context: Context, id: String) {
         val app = context.applicationContext
+        val previousTools = getCachedTools(app)
         val arr = JSONArray()
         listServers(app).filterNot { it.id == id }.forEach { s -> arr.put(JSONObject().apply {
             put("id", s.id); put("name", s.name); put("transport", s.transport); put("endpoint", s.endpoint)
             put("command", s.command); put("workdir", s.workdir); put("enabled", s.enabled)
         }) }
         app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(LIST_KEY, arr.toString()).apply()
+        cachedTools = previousTools.filterNot { it.server.id == id }
+        persistTools(app, cachedTools)
         SecureKeyStore.saveSecret(app, tokenKey(id), "")
     }
 
@@ -117,6 +146,7 @@ object McpManager {
             }
         }
         cachedTools = found
+        persistTools(context, found)
         found
     }
 
@@ -169,7 +199,7 @@ object McpManager {
         if (token.isNotBlank()) req.setRequestProperty("Authorization", "Bearer $token")
         req.outputStream.use {
             it.write(request("initialize", JSONObject().put("protocolVersion", PROTOCOL_VERSION)
-                .put("capabilities", JSONObject()).put("clientInfo", JSONObject().put("name", "LLM Notes").put("version", "1.4.2"))).toString().toByteArray())
+                .put("capabilities", JSONObject()).put("clientInfo", JSONObject().put("name", "LLM Notes").put("version", "1.4.3"))).toString().toByteArray())
         }
         val response = parseResponse(req)
         val session = req.getHeaderField("Mcp-Session-Id").orEmpty()
@@ -199,7 +229,7 @@ object McpManager {
     private suspend fun callStdio(context: Context, server: McpServer, operation: JSONObject): JSONObject {
         val (method, params) = operation.getString("method") to (operation.optJSONObject("params") ?: JSONObject())
         val init = request("initialize", JSONObject().put("protocolVersion", PROTOCOL_VERSION)
-            .put("capabilities", JSONObject()).put("clientInfo", JSONObject().put("name", "LLM Notes").put("version", "1.4.2")), 1)
+            .put("capabilities", JSONObject()).put("clientInfo", JSONObject().put("name", "LLM Notes").put("version", "1.4.3")), 1)
         val notify = JSONObject().put("jsonrpc", "2.0").put("method", "notifications/initialized")
         val actual = request(method, params, 2)
         val stdin = listOf(init, notify, actual).joinToString("\n") { it.toString() } + "\n"

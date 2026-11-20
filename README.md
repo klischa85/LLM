@@ -558,3 +558,8 @@ adb push models_gguf/qwen2.5-1.5b-q4_k_m.gguf /sdcard/Download/
 - Bearer-токены хранятся отдельно, зашифрованными AES-GCM через Android Keystore; HTTP незашифрован разрешён только для loopback.
 - По умолчанию вызовы с `readOnlyHint=true` выполняются без паузы; MCP-инструменты без этого признака требуют подтверждения. Режим «План» блокирует исполнение MCP-вызовов.
 - Локальные stdio MCP-команды выполняются в Termux и поэтому требуют установленный Termux и разрешение `RUN_COMMAND`.
+
+### MCP initialization latency fix (`v1.4.3`)
+
+- MCP `tools/list` discovery now runs only when the user taps **«Проверить»** in MCP settings. The discovered tool schemas and read-only hints are cached locally and reused in chat, so every offline/online chat turn no longer blocks on network calls or Termux process startup.
+- MCP server schemas are refreshed explicitly from the server settings screen; adding/removing servers invalidates the corresponding cached tool list.

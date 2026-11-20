@@ -1536,11 +1536,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 ""
             }
 
+            // Use saved discovery results only: don't block every chat turn on network/Termux MCP handshakes.
             val availableMcpTools = if (agentEnabled && !activePlanOnlyMode) {
-                try { McpManager.listTools(getApplication()) } catch (e: Exception) {
-                    Log.w(TAG, "MCP discovery failed: ${e.message}")
-                    emptyList()
-                }
+                McpManager.getCachedTools(getApplication())
             } else emptyList()
 
             val mcpPrompt = McpManager.promptForTools(availableMcpTools)
