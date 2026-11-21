@@ -130,6 +130,9 @@ data class UiState(
     val agentConfirmationMode: AgentConfirmationMode = AgentConfirmationMode.CONFIRM_DESTRUCTIVE,
     val isAgentDialogVisible: Boolean = false,
     val isBrowserVisible: Boolean = false,
+    // Встроенный веб-чат DeepSeek (провайдер без API-ключа)
+    val isDeepSeekWebVisible: Boolean = false,
+    val deepSeekWebSeedPrompt: String = "",
     val browserSearchEngine: BrowserSearchEngine = BrowserSearchEngine.DUCKDUCKGO,
     val browserIncognitoMode: Boolean = false,
     val termuxStatus: TermuxStatus = TermuxStatus(isInstalled = false, hasRunPermission = false),
@@ -150,6 +153,8 @@ data class UiState(
     val isReadyToChat: Boolean
         get() = when (providerType) {
             LLMProviderType.LOCAL_GGUF -> isModelLoaded
+            // Веб-провайдеру API-ключ не нужен: готовность определяет сессия на сайте
+            LLMProviderType.DEEPSEEK_WEB -> true
             LLMProviderType.CUSTOM_OPENAI -> customBaseUrl.isNotBlank()
             else -> hasCurrentApiKey
         }
@@ -380,6 +385,48 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setBrowserVisible(visible: Boolean) {
         _uiState.update { it.copy(isBrowserVisible = visible) }
+    }
+
+    // ==================== Встроенный веб-чат DeepSeek (без API-ключа) ====================
+
+    fun setDeepSeekWebVisible(visible: Boolean) {
+        _uiState.update {
+            it.copy(
+                isDeepSeekWebVisible = visible,
+                // два WebView одновременно не монтируем
+                isBrowserVisible = if (visible) false else it.isBrowserVisible,
+                deepSeekWebSeedPrompt = if (visible) it.deepSeekWebSeedPrompt else ""
+            )
+        }
+    }
+
+    /**
+     * Сохраняет ответ, снятый из веб-чата DeepSeek, как обычное сообщение ассистента
+     * в текущий чат (или в новый, если чата ещё нет).
+     */
+    fun saveDeepSeekWebAnswer(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        val state = _uiState.value
+        val message = ChatMessage(role = MessageRole.ASSISTANT, text = clean)
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val chatId = state.currentChatId.ifBlank {
+                val newId = UUID.randomUUID().toString()
+                dbHelper.createSession(newId, clean.take(40).replace("\n", " "))
+                newId
+            }
+            dbHelper.saveMessage(chatId, message)
+            withContext(Dispatchers.Main) {
+                _uiState.update {
+                    it.copy(
+                        currentChatId = chatId,
+                        messages = it.messages + message,
+                        statusMessage = "🐳 Ответ DeepSeek сохранён в чат"
+                    )
+                }
+            }
+        }
     }
 
     fun setBrowserSearchEngine(engine: BrowserSearchEngine) {
@@ -1397,6 +1444,19 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 AttachmentCategory.PDF -> "Проанализируй прикреплённый PDF-документ (${attached.name})"
                 else -> "Проанализируй прикреплённый файл (${attached?.name ?: "документ"})"
             }
+        }
+
+        // Веб-провайдер без API-ключа: открываем встроенный чат DeepSeek и передаём промпт
+        if (stateSnapshot.providerType == LLMProviderType.DEEPSEEK_WEB) {
+            _uiState.update {
+                it.copy(
+                    isDeepSeekWebVisible = true,
+                    isBrowserVisible = false,
+                    deepSeekWebSeedPrompt = prompt.trim(),
+                    inputText = ""
+                )
+            }
+            return
         }
 
         val isLocal = stateSnapshot.providerType == LLMProviderType.LOCAL_GGUF

@@ -249,6 +249,19 @@ enum class LLMProviderType(
         tip = "💡 Укажите Base URL до /v1 (например http://192.168.1.10:11434/v1 для Ollama или https://api.together.xyz/v1).",
         supportsVision = true,
         requiresApiKey = false
+    ),
+    DEEPSEEK_WEB(
+        displayName = "DeepSeek Web (без ключа)",
+        chipLabel = "🐳 DeepSeek Web",
+        baseUrl = "https://chat.deepseek.com",
+        apiKeyUrl = "https://chat.deepseek.com",
+        apiKeyUrlLabel = "chat.deepseek.com",
+        hasFreeTier = true,
+        keyPlaceholder = "",
+        description = "🐳 Официальный веб-чат DeepSeek внутри приложения: без API-ключа, вход по email/паролю или номеру телефона, история диалогов вашего аккаунта.",
+        tip = "💡 Сессия сохраняется после первого входа — повторно логиниться не нужно.",
+        supportsVision = false,
+        requiresApiKey = false
     )
 }
 
@@ -481,6 +494,7 @@ object OpenCodeClient {
     fun getDefaultModels(provider: LLMProviderType): List<String> {
         return when (provider) {
             LLMProviderType.LOCAL_GGUF -> emptyList()
+            LLMProviderType.DEEPSEEK_WEB -> emptyList()
             LLMProviderType.GEMINI -> GEMINI_DEFAULT_MODELS
             LLMProviderType.OPENROUTER -> OPENROUTER_DEFAULT_MODELS
             LLMProviderType.GROQ -> GROQ_DEFAULT_MODELS
@@ -519,6 +533,8 @@ object OpenCodeClient {
         customBaseUrl: String = ""
     ): List<String> {
         if (provider == LLMProviderType.LOCAL_GGUF) return emptyList()
+        // Веб-провайдер не имеет REST-каталога моделей: работаем через сайт
+        if (provider == LLMProviderType.DEEPSEEK_WEB) return emptyList()
         if (provider.requiresApiKey && apiKey.isBlank()) return getDefaultModels(provider)
 
         val base = resolveBaseUrl(provider, customBaseUrl)

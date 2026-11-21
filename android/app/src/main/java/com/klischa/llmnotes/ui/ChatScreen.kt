@@ -565,6 +565,15 @@ fun ChatScreen(
                 onAttachTextToChat = { viewModel.attachBrowserTextToChat() }
             )
         }
+
+        // Встроенный веб-чат DeepSeek (провайдер без API-ключа)
+        if (uiState.isDeepSeekWebVisible) {
+            DeepSeekWebScreen(
+                seedPrompt = uiState.deepSeekWebSeedPrompt,
+                onSaveAnswer = { viewModel.saveDeepSeekWebAnswer(it) },
+                onClose = { viewModel.setDeepSeekWebVisible(false) }
+            )
+        }
     }
 }
 
@@ -1037,6 +1046,37 @@ fun ProviderSettingsDialog(
                         onClick = { showOnlyFree = false },
                         label = { Text("Все (${allProviders.size})", fontSize = 11.sp) }
                     )
+                }
+
+                // Провайдер без API-ключа: вход выполняется на сайте DeepSeek
+                if (provider == LLMProviderType.DEEPSEEK_WEB) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "🐳 Ключ не нужен — вход выполняется один раз на сайте DeepSeek и сохраняется в приложении.",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                            Button(
+                                onClick = {
+                                    viewModel.setDeepSeekWebVisible(true)
+                                    onDismiss()
+                                },
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Text("🐳 Открыть веб-чат DeepSeek", fontSize = 11.sp)
+                            }
+                        }
+                    }
                 }
 
                 // Горизонтальная карусель чипов провайдеров (с индикатором сохранённого ключа 🔒)
