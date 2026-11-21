@@ -8,22 +8,48 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.klischa.llmnotes.AgentTools
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import kotlin.coroutines.resume
 
 /**
- * Управляет отдельным WebView для официального веб-чата DeepSeek (провайдер без API-ключа).
+ * Обёртка над WebView официального веб-чата DeepSeek (провайдер без API-ключа).
  *
  * Сознательно НЕ переиспользует AgentBrowserEngine: тот является object с единственным
  * shared WebView и собственными WebViewClient, поэтому два экрана конфликтовали бы.
+ *
+ * С версии v1.4.7 умеет вести tool-loop: ответ модели разбирается на вызовы
+ * инструментов тем же парсером, что и в нативном режиме агента (AgentTools),
+ * результаты возвращаются в чат следующим сообщением.
  */
 class DeepSeekWebController(private val appContext: Context) {
 
     companion object {
         const val HOME_URL = "https://chat.deepseek.com"
         private const val HOST = "chat.deepseek.com"
+        private const val POLL_INTERVAL_MS = 400L
+        const val STABLE_MS = 2_500L
+        const val HARD_STABLE_MS = 6_000L
+        const val TIMEOUT_MS = 90_000L
+        const val MAX_OBSERVATION_CHARS = 6_000
+        /** Инструменты, включённые по умолчанию: только чтение, без записи и Termux. */
+        val DEFAULT_SAFE_TOOLS: Set<String> =
+            setOf("list_dir", "read_file", "search_files", "file_info")
 
+        /** Полный список канонических инструментов, доступных в tool-loop. */
+        val ALL_TOOLS: List<String> = listOf(
+            "list_dir", "read_file", "search_files", "file_info", "mkdir",
+            "write_file", "edit_file", "move_file", "delete_file", "run_termux",
+            "browser_search", "browser_open", "browser_read", "browser_click",
+            "browser_type", "browser_scroll", "browser_back", "browser_screenshot",
+            "browser_eval_js"
+        )
+
+        /** Вставка текста в textarea с обходом React-контроля значения. */
         private val SEED_INPUT_JS = """
             (function(){
               const ta = document.querySelector('textarea');
@@ -38,6 +64,36 @@ class DeepSeekWebController(private val appContext: Context) {
             })()
         """
 
+        /** Нажатие кнопки отправки: три стратегии, последняя — синтетический Enter. */
+        private val SUBMIT_JS = """
+            (function(){
+              const ta = document.querySelector('textarea');
+              if (!ta) return 'no-input';
+              const nodes = Array.from(document.querySelectorAll('div[role="button"], button'));
+              const visible = nodes.filter(function(n){
+                const r = n.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 && n.querySelector('svg');
+              });
+              const labelled = visible.find(function(n){
+                const l = (n.getAttribute('aria-label') || '').toLowerCase();
+                return l.indexOf('send') >= 0 || l.indexOf('отправ') >= 0;
+              });
+              if (labelled) { labelled.click(); return 'click'; }
+              const tr = ta.getBoundingClientRect();
+              let best = null, bestDist = Infinity;
+              visible.forEach(function(n){
+                const r = n.getBoundingClientRect();
+                const d = Math.abs(r.top - tr.top) + Math.abs(r.left - (tr.right - r.width / 2));
+                if (d < bestDist) { bestDist = d; best = n; }
+              });
+              if (best) { best.click(); return 'click'; }
+              const ev = new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true});
+              ta.dispatchEvent(ev);
+              return 'enter';
+            })()
+        """
+
+        /** Извлечение текста последнего ответа ассистента: три стратегии по очереди. */
         private val EXTRACT_JS = """
             (function(){
               const tries = [
@@ -60,6 +116,15 @@ class DeepSeekWebController(private val appContext: Context) {
     }
 
     private val cookies: CookieManager get() = CookieManager.getInstance()
+
+    /** Универсальный запуск JS в WebView с обязательным переключением на main-поток. */
+    private suspend fun evalJs(web: WebView, script: String): String? = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { cont ->
+            runCatching {
+                web.evaluateJavascript(script) { r -> if (cont.isActive) cont.resume(r) }
+            }.onFailure { if (cont.isActive) cont.resume(null) }
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     fun configure(web: WebView) {
@@ -122,24 +187,224 @@ class DeepSeekWebController(private val appContext: Context) {
         if (prompt.isBlank()) return false
         val quoted = JSONObject.quote(prompt)
         val js = SEED_INPUT_JS.trimIndent().replace("%s", quoted)
-        return suspendCancellableCoroutine { cont ->
-            web.evaluateJavascript(js) { result ->
-                if (cont.isActive) cont.resume(result?.trim() == "true")
-            }
-        }
+        val res = evalJs(web, js)
+        return res?.trim() == "true"
+    }
+
+    /** Нажимает кнопку отправки. Возвращает true, если удалось отправить. */
+    suspend fun submitPrompt(web: WebView): Boolean {
+        val res = evalJs(web, SUBMIT_JS.trimIndent())
+        val clean = res?.removeSurrounding("\"")?.trim()
+        return clean == "click" || clean == "enter"
+    }
+
+    /** Вставляет текст и сразу отправляет его. */
+    suspend fun sendMessage(web: WebView, text: String): Boolean {
+        if (!seedPrompt(web, text)) return false
+        delay(250)
+        return submitPrompt(web)
     }
 
     /** Извлекает текст последнего ответа ассистента: три стратегии по очереди. */
-    suspend fun readLastAnswer(web: WebView): String? = suspendCancellableCoroutine { cont ->
-        web.evaluateJavascript(EXTRACT_JS.trimIndent()) { result ->
-            if (!cont.isActive) return@evaluateJavascript
-            val clean = result
-                ?.removeSurrounding("\"")
-                ?.replace("\\n", "\n")
-                ?.replace("\\\"", "\"")
-                ?.replace("\\\\", "\\")
-                ?.takeIf { it.isNotBlank() && it != "null" }
-            cont.resume(clean)
+    suspend fun readLastAnswer(web: WebView): String? {
+        val raw = evalJs(web, EXTRACT_JS.trimIndent()) ?: return null
+        return raw
+            .removeSurrounding("\"")
+            .replace("\\n", "\n")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+            .takeIf { it.isNotBlank() && it != "null" }
+    }
+
+    /** Признак идущей генерации: кнопка Stop видна в поле ввода. */
+    private val GENERATING_JS = """
+        (function(){
+          const nodes = Array.from(document.querySelectorAll('div[role="button"], button'));
+          for (const n of nodes) {
+            const r = n.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) continue;
+            const l = (n.getAttribute('aria-label') || '').toLowerCase();
+            const c = (n.className || '').toString().toLowerCase();
+            if (l.indexOf('stop') >= 0 || l.indexOf('останов') >= 0) return true;
+            if (c.indexOf('stop') >= 0) return true;
+          }
+          return false;
+        })()
+    """
+
+    /**
+     * Ждёт завершения ответа веб-чата. Приоритет — точный сигнал (исчезновение Stop);
+     * резерв — стабилизация текста ответа в течение [STABLE_MS]. Если и это не сработало,
+     * срабатывает жёсткий таймаут, и вызывающая сторона показывает ошибку.
+     */
+    suspend fun waitForAnswer(
+        web: WebView,
+        previousText: String?,
+        timeoutMs: Long = TIMEOUT_MS,
+        onProgress: (String) -> Unit = {}
+    ): String? {
+        val baseline = previousText.orEmpty()
+        val startedAt = System.currentTimeMillis()
+        var lastText = ""
+        var lastChangeAt = System.currentTimeMillis()
+        var sawAnyText = false
+
+        while (System.currentTimeMillis() - startedAt < timeoutMs) {
+            delay(POLL_INTERVAL_MS)
+            val current = readLastAnswer(web).orEmpty()
+            val changed = current != lastText
+            if (changed) {
+                lastText = current
+                lastChangeAt = System.currentTimeMillis()
+                if (current.isNotBlank() && current != baseline) {
+                    sawAnyText = true
+                    onProgress(current)
+                }
+            }
+
+            val generating = evalJs(web, GENERATING_JS.trimIndent())?.trim() == "true"
+            val stableFor = System.currentTimeMillis() - lastChangeAt
+            
+            // Готово, если текст отличается от исходного и стабилен достаточно долго
+            if (sawAnyText && stableFor >= STABLE_MS) {
+                // при явном индикаторе генерации ждём ещё, но не дольше остатка таймаута
+                if (generating) continue
+                return lastText
+            }
+            // Резервный выход: индикатора нет, текст не менялся дольше жёсткого порога
+            if (!generating && sawAnyText && stableFor >= HARD_STABLE_MS) {
+                return lastText
+            }
         }
+        return lastText.takeIf { it.isNotBlank() && it != baseline }
+    }
+
+    /** Разрешённые пользователем инструменты (имена из AgentTools). */
+    class ToolPolicy(
+        val enabledTools: Set<String>,
+        val maxIterations: Int = 8,
+        val maxCalls: Int = 20,
+        val enableSkills: Boolean = false
+    )
+
+    /** Итог одного прогона tool-loop. */
+    data class ToolLoopOutcome(
+        val finalText: String,
+        val iterations: Int,
+        val calls: Int,
+        val failed: Boolean = false,
+        val failReason: String? = null
+    )
+
+    /**
+     * Основной цикл: отправляет промпт, ждёт ответ, извлекает вызовы инструментов,
+     * выполняет разрешённые и возвращает результат обратно в чат следующим сообщением.
+     *
+     * @param systemPrefix добавляется к первому сообщению (промпт агента / скиллы).
+     */
+    suspend fun runToolLoop(
+        web: WebView,
+        userPrompt: String,
+        policy: ToolPolicy,
+        systemPrefix: String = "",
+        isCancelled: () -> Boolean = { false },
+        onStatus: (String) -> Unit = {},
+        onPartial: (String) -> Unit = {}
+    ): ToolLoopOutcome {
+        var callsUsed = 0
+        var lastAnswer: String? = null
+        var finalText = ""
+
+        val firstMessage = if (systemPrefix.isBlank()) userPrompt
+                           else systemPrefix.trimEnd() + "\n\n" + userPrompt
+
+        if (!sendMessage(web, firstMessage)) {
+            return ToolLoopOutcome(
+                finalText = "",
+                iterations = 0,
+                calls = 0,
+                failed = true,
+                failReason = "Не удалось вставить текст в поле ввода веб-чата"
+            )
+        }
+
+        var iteration = 0
+        while (iteration < policy.maxIterations) {
+            if (isCancelled()) break
+            iteration++
+            onStatus("Ожидание ответа DeepSeek (итерация $iteration)...")
+
+            val answer = waitForAnswer(web, lastAnswer, onProgress = onPartial)
+            if (answer.isNullOrBlank()) {
+                return ToolLoopOutcome(
+                    finalText = finalText,
+                    iterations = iteration,
+                    calls = callsUsed,
+                    failed = true,
+                    failReason = "Ответ не получен: кнопка Stop не исчезла и текст не стабилизировался за $TIMEOUT_MS мс"
+                )
+            }
+            lastAnswer = answer
+
+            val extraction = AgentTools.extractToolCallsDetailed(answer)
+            val allowed = extraction.calls.filter { it.tool in policy.enabledTools }
+
+            if (allowed.isEmpty()) {
+                // нет вызовов — это финальный ответ
+                finalText = AgentTools.stripToolCallBlocks(answer).trim().ifEmpty { answer.trim() }
+                return ToolLoopOutcome(finalText, iteration, callsUsed)
+            }
+
+            // бюджет вызовов
+            val budgetLeft = policy.maxCalls - callsUsed
+            if (budgetLeft <= 0) {
+                finalText = AgentTools.stripToolCallBlocks(answer).trim()
+                return ToolLoopOutcome(
+                    finalText,
+                    iteration,
+                    callsUsed,
+                    failed = true,
+                    failReason = "Исчерпан лимит вызовов инструментов (${policy.maxCalls})"
+                )
+            }
+
+            val batch = allowed.take(budgetLeft)
+            val observations = StringBuilder()
+            for (call in batch) {
+                if (isCancelled()) break
+                callsUsed++
+                onStatus("⚙️ Выполняется: ${call.tool}...")
+                val res = runCatching { AgentTools.execute(appContext, call) }.getOrNull()
+                val ok = res?.ok == true
+                observations.append("<tool_result tool=\"${call.tool}\" status=\"").append(if (ok) "ok" else "error").append("\">\n")
+                observations.append((res?.output ?: "Ошибка выполнения инструмента").take(MAX_OBSERVATION_CHARS))
+                observations.append("\n</tool_result>\n")
+            }
+
+            if (isCancelled()) break
+
+            val followUp = "Результаты инструментов:\n" + observations.toString() +
+                "\nПродолжай: если задача решена — дай итоговый ответ пользователю без вызовов инструментов."
+
+            if (!sendMessage(web, followUp)) {
+                return ToolLoopOutcome(
+                    finalText = finalText,
+                    iterations = iteration,
+                    calls = callsUsed,
+                    failed = true,
+                    failReason = "Не удалось отправить результаты инструментов в веб-чат"
+                )
+            }
+        }
+
+        // лимит итераций
+        val tail = AgentTools.stripToolCallBlocks(lastAnswer.orEmpty()).trim()
+        return ToolLoopOutcome(
+            finalText = tail,
+            iterations = iteration,
+            calls = callsUsed,
+            failed = true,
+            failReason = "Достигнут лимит итераций (${policy.maxIterations})"
+        )
     }
 }

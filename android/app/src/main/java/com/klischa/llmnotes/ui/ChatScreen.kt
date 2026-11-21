@@ -571,7 +571,16 @@ fun ChatScreen(
             DeepSeekWebScreen(
                 seedPrompt = uiState.deepSeekWebSeedPrompt,
                 onSaveAnswer = { viewModel.saveDeepSeekWebAnswer(it) },
-                onClose = { viewModel.setDeepSeekWebVisible(false) }
+                onClose = { viewModel.setDeepSeekWebVisible(false) },
+                toolLoopEnabled = uiState.deepSeekToolLoopEnabled,
+                enabledTools = uiState.deepSeekEnabledTools,
+                systemPrefix = buildDeepSeekSystemPrefix(
+                    skillsEnabled = uiState.deepSeekSkillsEnabled,
+                    skills = uiState.skills,
+                    userPrompt = uiState.deepSeekWebSeedPrompt,
+                    termuxStatus = uiState.termuxStatus,
+                    searchEngine = uiState.browserSearchEngine
+                )
             )
         }
     }
@@ -1075,6 +1084,15 @@ fun ProviderSettingsDialog(
                             ) {
                                 Text("🐳 Открыть веб-чат DeepSeek", fontSize = 11.sp)
                             }
+
+                            DeepSeekToolLoopSettings(
+                                enabled = uiState.deepSeekToolLoopEnabled,
+                                enabledTools = uiState.deepSeekEnabledTools,
+                                skillsEnabled = uiState.deepSeekSkillsEnabled,
+                                onToggleEnabled = { viewModel.setDeepSeekToolLoopEnabled(it) },
+                                onToggleTool = { tool, on -> viewModel.setDeepSeekToolEnabled(tool, on) },
+                                onToggleSkills = { viewModel.setDeepSeekSkillsEnabled(it) }
+                            )
                         }
                     }
                 }

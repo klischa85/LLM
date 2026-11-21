@@ -15,6 +15,7 @@ import com.klischa.llmnotes.api.OpenCodeClient
 import com.klischa.llmnotes.browser.AgentBrowserEngine
 import com.klischa.llmnotes.browser.BrowserSearchEngine
 import com.klischa.llmnotes.security.SecureKeyStore
+import com.klischa.llmnotes.web.DeepSeekWebController
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -133,6 +134,10 @@ data class UiState(
     // Встроенный веб-чат DeepSeek (провайдер без API-ключа)
     val isDeepSeekWebVisible: Boolean = false,
     val deepSeekWebSeedPrompt: String = "",
+    // v1.4.7: tool-loop в веб-чате DeepSeek (по умолчанию выключен)
+    val deepSeekToolLoopEnabled: Boolean = false,
+    val deepSeekEnabledTools: Set<String> = DeepSeekWebController.DEFAULT_SAFE_TOOLS,
+    val deepSeekSkillsEnabled: Boolean = false,
     val browserSearchEngine: BrowserSearchEngine = BrowserSearchEngine.DUCKDUCKGO,
     val browserIncognitoMode: Boolean = false,
     val termuxStatus: TermuxStatus = TermuxStatus(isInstalled = false, hasRunPermission = false),
@@ -202,6 +207,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREF_AGENT_CONFIRM_MODE = "agent_confirm_mode"
         private const val PREF_BROWSER_SEARCH_ENGINE = "browser_search_engine"
         private const val PREF_BROWSER_INCOGNITO = "browser_incognito"
+        private const val PREF_DS_TOOL_LOOP_ENABLED = "ds_tool_loop_enabled"
+        private const val PREF_DS_ENABLED_TOOLS = "ds_enabled_tools"
+        private const val PREF_DS_SKILLS_ENABLED = "ds_skills_enabled"
     }
 
     fun saveLastModelInfo(directPath: String?, uriStr: String?, displayName: String) {
@@ -357,6 +365,14 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         val savedEngineStr = prefs.getString(PREF_BROWSER_SEARCH_ENGINE, BrowserSearchEngine.DUCKDUCKGO.id)
         val browserEngine = BrowserSearchEngine.fromString(savedEngineStr) ?: BrowserSearchEngine.DUCKDUCKGO
         val browserIncognito = prefs.getBoolean(PREF_BROWSER_INCOGNITO, false)
+        val dsToolLoop = prefs.getBoolean(PREF_DS_TOOL_LOOP_ENABLED, false)
+        val dsSkills = prefs.getBoolean(PREF_DS_SKILLS_ENABLED, false)
+        val dsToolsRaw = prefs.getStringSet(PREF_DS_ENABLED_TOOLS, null)
+        val dsTools = dsToolsRaw
+            ?.filter { it in DeepSeekWebController.ALL_TOOLS }
+            ?.toSet()
+            ?.takeIf { it.isNotEmpty() }
+            ?: DeepSeekWebController.DEFAULT_SAFE_TOOLS
         AgentBrowserEngine.initSettings(browserEngine, browserIncognito)
 
         val termuxStatus = TermuxBridge.checkStatus(app)
@@ -375,6 +391,9 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 agentConfirmationMode = confirmMode,
                 browserSearchEngine = browserEngine,
                 browserIncognitoMode = browserIncognito,
+                deepSeekToolLoopEnabled = dsToolLoop,
+                deepSeekEnabledTools = dsTools,
+                deepSeekSkillsEnabled = dsSkills,
                 termuxStatus = termuxStatus
             )
             updated.copy(statusMessage = buildIdleStatus(updated))
@@ -398,6 +417,38 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 deepSeekWebSeedPrompt = if (visible) it.deepSeekWebSeedPrompt else ""
             )
         }
+    }
+
+    /** v1.4.7: главный переключатель tool-loop в веб-чате DeepSeek. */
+    fun setDeepSeekToolLoopEnabled(enabled: Boolean) {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(PREF_DS_TOOL_LOOP_ENABLED, enabled).apply()
+        _uiState.update {
+            it.copy(
+                deepSeekToolLoopEnabled = enabled,
+                statusMessage = if (enabled)
+                    "🔧 Инструменты в веб-чате включены: ответы DeepSeek будут уходить с данными инструментов"
+                else
+                    "Веб-чат DeepSeek: обычный режим без инструментов"
+            )
+        }
+    }
+
+    /** v1.4.7: включение/отключение отдельного инструмента в tool-loop. */
+    fun setDeepSeekToolEnabled(tool: String, enabled: Boolean) {
+        if (tool !in DeepSeekWebController.ALL_TOOLS) return
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val next = _uiState.value.deepSeekEnabledTools.toMutableSet()
+        if (enabled) next.add(tool) else next.remove(tool)
+        prefs.edit().putStringSet(PREF_DS_ENABLED_TOOLS, next).apply()
+        _uiState.update { it.copy(deepSeekEnabledTools = next.toSet()) }
+    }
+
+    /** v1.4.7: передавать ли активные скиллы в промпт веб-чата. */
+    fun setDeepSeekSkillsEnabled(enabled: Boolean) {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(PREF_DS_SKILLS_ENABLED, enabled).apply()
+        _uiState.update { it.copy(deepSeekSkillsEnabled = enabled) }
     }
 
     /**

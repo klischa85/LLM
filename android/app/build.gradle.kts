@@ -12,8 +12,8 @@ android {
         applicationId = "com.klischa.llmnotes"
         minSdk = 26
         targetSdk = 34
-        versionCode = 37
-        versionName = "1.4.6"
+        versionCode = 38
+        versionName = "1.4.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
