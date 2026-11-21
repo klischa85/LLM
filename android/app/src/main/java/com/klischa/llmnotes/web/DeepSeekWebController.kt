@@ -3,6 +3,7 @@ package com.klischa.llmnotes.web
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -127,7 +128,10 @@ class DeepSeekWebController(private val appContext: Context) {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    fun configure(web: WebView) {
+    fun configure(
+        web: WebView,
+        onPageFinished: (WebView, String?) -> Unit = { _, _ -> }
+    ) {
         cookies.setAcceptCookie(true)
         cookies.setAcceptThirdPartyCookies(web, true)
 
@@ -145,6 +149,9 @@ class DeepSeekWebController(private val appContext: Context) {
         }
         web.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
 
+        // Внутренние адреса остаются в WebView (включая узел антибот-проверки awswaf),
+        // внешние уходят в системный браузер. Экран обязан пользоваться именно этим
+        // configure(): раньше он перезаписывал webViewClient и терял обработчик переходов.
         web.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView,
@@ -153,17 +160,52 @@ class DeepSeekWebController(private val appContext: Context) {
                 val host = request.url.host ?: return false
                 val internal = host == HOST || host.endsWith(".deepseek.com") ||
                     host.endsWith("google.com") || host.endsWith("gstatic.com") ||
-                    host.endsWith("cloudflare.com")
+                    host.endsWith("cloudflare.com") || host.endsWith("awswaf.com")
                 if (internal) return false
-                runCatching {
-                    appContext.startActivity(
-                        Intent(Intent.ACTION_VIEW, request.url)
-                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    )
-                }
+                openExternally(request.url.toString())
                 return true
             }
+
+            override fun onPageFinished(view: WebView, url: String?) {
+                onPageFinished.invoke(view, url)
+            }
         }
+    }
+
+    /** Открывает адрес в системном браузере. true — если переход состоялся. */
+    fun openExternally(url: String): Boolean = runCatching {
+        appContext.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+        true
+    }.getOrDefault(false)
+
+    /**
+     * Проверяет, отрисовался ли настоящий интерфейс чата.
+     * Возвращает код причины, если страница пустая или под антибот-заглушкой:
+     * "waf", "challenge", "empty", "error"; пустая строка — страница в порядке;
+     * null — не удалось опросить страницу.
+     */
+    suspend fun diagnoseBlankPage(web: WebView): String? {
+        val js = """
+            (function(){
+              try {
+                if (document.getElementById('challenge-container')) return 'waf';
+                var b = document.body;
+                if (!b) return 'empty';
+                var t = (b.innerText || '').trim();
+                if (!t) return 'empty';
+                if (/just a moment|checking your browser|verify you are human/i.test(t)) return 'challenge';
+                if (document.querySelector('textarea')) return '';
+                if (t.length < 40) return 'empty';
+                return '';
+              } catch (e) { return 'error'; }
+            })()
+        """.trimIndent()
+        val raw = evalJs(web, js) ?: return null
+        val code = raw.removeSurrounding("\"").trim()
+        return code.takeIf { it != "null" }
     }
 
     /** Сессия DeepSeek хранится в HttpOnly-cookie, поэтому читаем её только через CookieManager. */

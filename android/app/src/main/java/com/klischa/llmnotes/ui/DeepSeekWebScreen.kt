@@ -6,7 +6,6 @@ import android.annotation.SuppressLint
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
 import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -24,6 +23,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.klischa.llmnotes.web.DeepSeekWebController
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+/** Сколько ждать отрисовку чата, прежде чем показать баннер о проблеме. */
+private const val PAGE_DIAGNOSE_TIMEOUT_MS = 25_000L
 
 /**
  * Полноценный веб-чат DeepSeek внутри приложения: провайдер без API-ключа.
@@ -61,6 +63,11 @@ fun DeepSeekWebScreen(
     var partialText by remember { mutableStateOf("") }
     var errorBanner by remember { mutableStateOf<String?>(null) }
     var cancelRequested by remember { mutableStateOf(false) }
+
+    // Состояние загрузки страницы и диагностики пустого экрана
+    var pageLoading by remember { mutableStateOf(true) }
+    var pageProblem by remember { mutableStateOf<String?>(null) }
+    var blankCheck by remember { mutableStateOf(0) }
 
     DisposableEffect(Unit) {
         onDispose { controller.persistCookies() }
@@ -204,7 +211,7 @@ fun DeepSeekWebScreen(
                 )
             )
 
-            if (isRunning) {
+            if (isRunning || pageLoading) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
 
@@ -293,13 +300,14 @@ fun DeepSeekWebScreen(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT
                             )
-                            controller.configure(this)
-                            webChromeClient = WebChromeClient()
-                            webViewClient = object : WebViewClient() {
-                                override fun onPageFinished(view: WebView, url: String?) {
-                                    isLoggedIn = controller.isLoggedIn()
-                                }
+                            // configure() сам держит shouldOverrideUrlLoading; экран лишь
+                            // добавляет к нему свой колбэк окончания загрузки.
+                            controller.configure(this) { _, _ ->
+                                isLoggedIn = controller.isLoggedIn()
+                                pageLoading = false
+                                blankCheck++
                             }
+                            webChromeClient = WebChromeClient()
                             controller.navigateHome(this)
                             webView = this
                         }
@@ -310,7 +318,50 @@ fun DeepSeekWebScreen(
                     }
                 )
 
-                if (!isLoggedIn) {
+                val problem = pageProblem
+                if (problem != null) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shape = MaterialTheme.shapes.medium,
+                        tonalElevation = 3.dp
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = "Страница DeepSeek не загрузилась",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = pageProblemText(problem),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                TextButton(onClick = {
+                                    val w = webView
+                                    pageProblem = null
+                                    if (w != null) {
+                                        pageLoading = true
+                                        controller.navigateHome(w)
+                                    }
+                                }) { Text("Повторить") }
+                                TextButton(onClick = {
+                                    controller.openExternally(DeepSeekWebController.HOME_URL)
+                                }) { Text("В Chrome") }
+                                TextButton(onClick = { pageProblem = null }) { Text("Скрыть") }
+                            }
+                        }
+                    }
+                } else if (!isLoggedIn) {
                     Surface(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -322,14 +373,51 @@ fun DeepSeekWebScreen(
                     ) {
                         Text(
                             text = "Войдите по email/паролю или номеру телефона. " +
-                                "Вход через Google в WebView недоступен — используйте " +
-                                "адрес электронной почты DeepSeek.",
+                                "Если экран остаётся пустым, включите VPN — так проходит " +
+                                "антибот-проверка сайта.",
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(12.dp)
                         )
                     }
                 }
             }
+        }
+    }
+
+    // Страховка: если навигация вообще не завершилась, снимаем индикатор сами.
+    LaunchedEffect(pageLoading) {
+        if (!pageLoading) return@LaunchedEffect
+        delay(PAGE_DIAGNOSE_TIMEOUT_MS)
+        if (pageLoading) {
+            pageLoading = false
+            if (pageProblem == null && !isLoggedIn) pageProblem = "timeout"
+        }
+    }
+
+    // Диагностика пустого экрана: AWS WAF-заглушка, неотрисованный чат, таймаут.
+    LaunchedEffect(blankCheck) {
+        if (blankCheck == 0) return@LaunchedEffect
+        val w = webView ?: return@LaunchedEffect
+        pageProblem = null
+        if (isLoggedIn) return@LaunchedEffect
+
+        var waited = 0L
+        var code = controller.diagnoseBlankPage(w)
+        // null = страница ещё не ответила; "" = чат отрисован; иначе — код проблемы.
+        while (waited < PAGE_DIAGNOSE_TIMEOUT_MS && code == null && !isLoggedIn) {
+            delay(2_000)
+            waited += 2_000
+            if (isLoggedIn) return@LaunchedEffect
+            code = controller.diagnoseBlankPage(w)
+        }
+        if (isLoggedIn) return@LaunchedEffect
+
+        val finalCode = code
+        pageLoading = false
+        pageProblem = when {
+            finalCode == null -> "timeout"
+            finalCode.isEmpty() -> null
+            else -> finalCode
         }
     }
 
@@ -344,4 +432,15 @@ fun DeepSeekWebScreen(
         val ok = controller.seedPrompt(w, seedPrompt)
         if (ok) seeded = true
     }
+}
+
+/** Понятный текст подсказки для конкретной причины пустой страницы. */
+private fun pageProblemText(code: String): String = when (code) {
+    "waf", "challenge" -> "Сайт показывает проверку AWS WAF, но её скрипт не загружается — " +
+        "обычно это блокировка у провайдера. Включите VPN или переключитесь на мобильный " +
+        "интернет и нажмите «Повторить»."
+    "empty" -> "Сервер вернул пустую страницу. Проверьте соединение и нажмите «Повторить»."
+    "timeout" -> "Страница не отрисовалась за 25 секунд: похоже, загрузка скриптов " +
+        "проверки блокируется. Включите VPN и нажмите «Повторить»."
+    else -> "Не удалось открыть веб-чат. Нажмите «Повторить» или откройте сайт в Chrome."
 }
