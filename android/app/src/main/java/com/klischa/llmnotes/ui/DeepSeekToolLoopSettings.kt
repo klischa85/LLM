@@ -31,16 +31,17 @@ fun buildDeepSeekSystemPrefix(
     termuxStatus: TermuxStatus,
     searchEngine: BrowserSearchEngine
 ): String {
-    if (!skillsEnabled) return ""
-    val resolved = SkillManager.resolveSkillsForPrompt(
-        allSkills = skills,
-        userPrompt = userPrompt,
-        isLocalCompact = false
-    )
     val agentBlock = AgentTools.buildAgentSystemPrompt(termuxStatus, searchEngine)
+    val skillsBlock = if (skillsEnabled) {
+        SkillManager.resolveSkillsForPrompt(
+            allSkills = skills,
+            userPrompt = userPrompt,
+            isLocalCompact = false
+        ).systemBlock.trim()
+    } else ""
     return buildString {
-        if (resolved.systemBlock.isNotBlank()) {
-            append(resolved.systemBlock.trim())
+        if (skillsBlock.isNotBlank()) {
+            append(skillsBlock)
             append("\n\n")
         }
         append(agentBlock.trim())

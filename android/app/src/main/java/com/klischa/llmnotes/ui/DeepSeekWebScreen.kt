@@ -13,7 +13,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -166,13 +165,7 @@ fun DeepSeekWebScreen(
                     if (isLoggedIn && toolLoopEnabled) {
                         if (isRunning) {
                             TextButton(onClick = { cancelRequested = true }) {
-                                Icon(
-                                    Icons.Default.Stop,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Стоп")
+                                Text("⏹ Стоп")
                             }
                         } else {
                             TextButton(onClick = { startToolLoop() }) {
