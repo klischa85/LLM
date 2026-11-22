@@ -421,6 +421,25 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Возврат из полноэкранного веб-чата в нативную ленту.
+     *
+     * Закрывает веб-экран и просит скрытый хост перечитать страницу с текущими
+     * куками. Сообщения, отправленные сразу после возврата, уходят уже в фоновый
+     * WebView; увеличенное окно ожидания в [startHiddenWebExchange] даёт странице
+     * время дорисоваться, чтобы форма не осталась пустой.
+     */
+    fun returnToChatFromWeb() {
+        DeepSeekWebBridge.requestReload()
+        _uiState.update {
+            it.copy(
+                isDeepSeekWebVisible = false,
+                deepSeekWebSeedPrompt = "",
+                statusMessage = "Веб-чат свёрнут: DeepSeek перечитывает страницу в фоне…"
+            )
+        }
+    }
+
     /** v1.4.7: главный переключатель tool-loop в веб-чате DeepSeek. */
     fun setDeepSeekToolLoopEnabled(enabled: Boolean) {
         val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1554,14 +1573,16 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { it.copy(chatSessions = sessions) }
             }
 
-            val pair = DeepSeekWebBridge.awaitReady()
+            val pair = DeepSeekWebBridge.awaitReady(timeoutMs = 40_000L)
             if (pair == null) {
                 openWebFallback("Фоновый веб-чат DeepSeek не готов — нужно один раз войти в аккаунт.")
                 return@launch
             }
             val (web, controller) = pair
 
-            if (!DeepSeekWebBridge.awaitInputReady(web, controller)) {
+            // После возврата из полноэкранного экрана страница грузится заново,
+            // поэтому окно ожидания расширено: иначе форма ещё пуста и отправка падает.
+            if (!DeepSeekWebBridge.awaitInputReady(web, controller, timeoutMs = 45_000L)) {
                 openWebFallback("Поле ввода DeepSeek не появилось — проверьте VPN и войдите в аккаунт.")
                 return@launch
             }

@@ -47,7 +47,8 @@ fun DeepSeekWebScreen(
     toolLoopEnabled: Boolean = false,
     enabledTools: Set<String> = DeepSeekWebController.DEFAULT_SAFE_TOOLS,
     systemPrefix: String = "",
-    onToolLoopFailure: (String) -> Unit = {}
+    onToolLoopFailure: (String) -> Unit = {},
+    onReturnToChat: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val controller = remember { DeepSeekWebController(context.applicationContext) }
@@ -208,6 +209,12 @@ fun DeepSeekWebScreen(
                         }) {
                             Text("В заметку")
                         }
+                    }
+                    TextButton(onClick = {
+                        runCatching { controller.persistCookies() }
+                        onReturnToChat()
+                    }) {
+                        Text("💬 В чат")
                     }
                     IconButton(onClick = onClose) {
                         Icon(Icons.Default.Close, contentDescription = "Закрыть")

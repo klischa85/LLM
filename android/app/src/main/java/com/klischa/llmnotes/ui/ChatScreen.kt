@@ -579,6 +579,7 @@ fun ChatScreen(
                 seedPrompt = uiState.deepSeekWebSeedPrompt,
                 onSaveAnswer = { viewModel.saveDeepSeekWebAnswer(it) },
                 onClose = { viewModel.setDeepSeekWebVisible(false) },
+                onReturnToChat = { viewModel.returnToChatFromWeb() },
                 toolLoopEnabled = uiState.deepSeekToolLoopEnabled,
                 enabledTools = uiState.deepSeekEnabledTools,
                 systemPrefix = buildDeepSeekSystemPrefix(
