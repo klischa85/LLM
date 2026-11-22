@@ -96,6 +96,7 @@ class DeepSeekWebController(private val appContext: Context) {
               const nodes = Array.from(document.querySelectorAll('div[role="button"], button'));
               const ta = document.querySelector('textarea');
               const draft = ta ? (ta.value || '') : '';
+              const lastMd = md.length ? (md[md.length - 1].innerText || '') : '';
 
               // Кнопка Stop на chat.deepseek.com не содержит слова stop ни в классе,
               // ни в aria-label (он пуст у всех кнопок). Её выдаёт квадратная иконка:
@@ -117,6 +118,7 @@ class DeepSeekWebController(private val appContext: Context) {
               }
               return JSON.stringify({
                 answers: md.length,
+                lastLen: lastMd.length,
                 busy: busy,
                 draftLen: draft.length,
                 sendReady: sendReady,
@@ -376,6 +378,7 @@ class DeepSeekWebController(private val appContext: Context) {
         val answers: Int,
         val busy: Boolean,
         val draftLen: Int,
+        val lastLen: Int = 0,
         val sendReady: Boolean = false,
         val vis: String = "",
         val url: String = "",
@@ -393,6 +396,7 @@ class DeepSeekWebController(private val appContext: Context) {
                 answers = o.optInt("answers"),
                 busy = o.optBoolean("busy"),
                 draftLen = o.optInt("draftLen"),
+                lastLen = o.optInt("lastLen"),
                 sendReady = o.optBoolean("sendReady"),
                 vis = o.optString("vis"),
                 url = o.optString("url"),
@@ -473,16 +477,42 @@ class DeepSeekWebController(private val appContext: Context) {
             return SubmitReport(false, "Кнопка отправки DeepSeek заблокирована: текст не принят полем ввода")
         }
         val startedAt = System.currentTimeMillis()
-        // Признак того, что поле реально очистилось после нажатия. Сам по себе
-        // не доказывает отправку (поле могло быть пустым изначально), но вместе
-        // с отсутствием роста answers уточняет причину отказа.
+        // Доказательства того, что запрос реально ушёл. В логах 1.4.16 ВСЕ отправки
+        // завершались FAIL при фактически доставленном сообщении: пользователь видел
+        // и свой запрос, и ответ на сайте, а приложение показывало ошибку — до
+        // waitForAnswer дело не доходило, и чат работал «в одну сторону».
+        // Причина: answers считает блоки [class*="ds-markdown"], а список сообщений
+        // виртуализирован — старые блоки размонтируются, счётчик падает (14 -> 4),
+        // роста не происходит никогда; busy по иконке Stop тоже не срабатывает.
         var sawDraftClear = false
+        var draftClearAt = 0L
+        val baseState = readSubmitState(web)
+        val urlBefore = baseState?.url.orEmpty()
+        val lastLenBefore = baseState?.lastLen ?: 0
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
             delay(500L)
             val st = readSubmitState(web) ?: continue
+            // 1. Появился новый блок ответа.
             if (st.answers > before) return SubmitReport(true)
+            // 2. Виден индикатор генерации.
             if (st.busy) return SubmitReport(true)
-            if (st.draftLen == 0) sawDraftClear = true
+            // 3. Текст последнего ответа изменился — идёт стриминг нового ответа.
+            if (st.lastLen != lastLenBefore) return SubmitReport(true)
+            if (st.draftLen == 0) {
+                if (!sawDraftClear) {
+                    sawDraftClear = true
+                    draftClearAt = System.currentTimeMillis()
+                }
+                // 4. Поле очистилось и адрес сменился — сервер создал новый чат.
+                if (urlBefore.isNotEmpty() && st.url != urlBefore) return SubmitReport(true)
+            }
+            // 5. Мягкий выход: поле очистилось после нажатия реальной кнопки отправки,
+            //    но индикаторы молчат. Ответ дождётся waitForAnswer. Ложное «ok»
+            //    стоит одного ожидания, ложный отказ блокирует уже пришедший ответ.
+            if (sawDraftClear && System.currentTimeMillis() - draftClearAt > 8_000L) {
+                diag("send: OK по очистке поля submit=" + submitted)
+                return SubmitReport(true)
+            }
         }
         diag("send: FAIL submit=" + submitted + " sawDraftClear=" + sawDraftClear + " answersBefore=" + before)
         diagState(web, "send-FAIL")
