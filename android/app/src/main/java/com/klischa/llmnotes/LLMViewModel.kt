@@ -15,6 +15,8 @@ import com.klischa.llmnotes.api.OpenCodeClient
 import com.klischa.llmnotes.browser.AgentBrowserEngine
 import com.klischa.llmnotes.browser.BrowserSearchEngine
 import com.klischa.llmnotes.security.SecureKeyStore
+import com.klischa.llmnotes.ui.buildDeepSeekSystemPrefix
+import com.klischa.llmnotes.web.DeepSeekWebBridge
 import com.klischa.llmnotes.web.DeepSeekWebController
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -1472,6 +1474,125 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
      * Если модель уже генерирует ответ — безопасно ставит дополнение в очередь (`enqueueFollowUp`),
      * не перебивая текущее сообщение.
      */
+    // ==================== Фоновый веб-чат DeepSeek (без прыжков между окнами) ====================
+
+    /**
+     * Отправляет сообщение в невидимый WebView DeepSeek и возвращает ответ
+     * в обычную ленту чата. Полноэкранный сайт при этом не открывается.
+     */
+    private fun startHiddenWebExchange(prompt: String, snapshot: UiState) {
+        val userMessage = ChatMessage(role = MessageRole.USER, text = prompt)
+        val assistantMessage = ChatMessage(role = MessageRole.ASSISTANT, text = "", isStreaming = true)
+        val assistantId = assistantMessage.id
+        val chatIdSnapshot = snapshot.currentChatId
+        val toolLoopOn = snapshot.deepSeekToolLoopEnabled
+        val enabledTools = snapshot.deepSeekEnabledTools
+        val systemPrefix = buildDeepSeekSystemPrefix(
+            skillsEnabled = snapshot.deepSeekSkillsEnabled,
+            skills = snapshot.skills,
+            userPrompt = prompt,
+            termuxStatus = snapshot.termuxStatus,
+            searchEngine = snapshot.browserSearchEngine
+        )
+
+        _uiState.update {
+            it.copy(
+                messages = it.messages + userMessage + assistantMessage,
+                inputText = "",
+                attachedDoc = null,
+                isGenerating = true,
+                pendingToolApproval = null,
+                activeToolStatus = if (toolLoopOn) "DeepSeek: цикл с инструментами..." else "DeepSeek: ожидание ответа...",
+                statusMessage = ""
+            )
+        }
+
+        isRemoteCancelled = false
+        val myEpoch = generationEpoch.incrementAndGet()
+
+        fun patchAssistant(text: String, streaming: Boolean) {
+            _uiState.update { st ->
+                st.copy(messages = st.messages.map {
+                    if (it.id == assistantId) it.copy(text = text, isStreaming = streaming) else it
+                })
+            }
+        }
+
+        fun fail(reason: String) {
+            if (generationEpoch.get() != myEpoch) return
+            patchAssistant("⚠️ $reason", false)
+            _uiState.update { it.copy(isGenerating = false, activeToolStatus = null, statusMessage = reason) }
+        }
+
+        generationJob = viewModelScope.launch(Dispatchers.IO) {
+            val chatId = chatIdSnapshot.ifBlank {
+                val newId = UUID.randomUUID().toString()
+                dbHelper.createSession(newId, prompt.replace("\n", " ").take(40))
+                _uiState.update { it.copy(currentChatId = newId) }
+                newId
+            }
+            runCatching { dbHelper.saveMessage(chatId, userMessage) }
+            runCatching {
+                val sessions = dbHelper.getAllSessions()
+                _uiState.update { it.copy(chatSessions = sessions) }
+            }
+
+            val pair = DeepSeekWebBridge.awaitReady()
+            if (pair == null) {
+                fail("Фоновый веб-чат DeepSeek не готов. Нажмите «Войти» и авторизуйтесь один раз.")
+                return@launch
+            }
+            val (web, controller) = pair
+
+            if (!DeepSeekWebBridge.awaitInputReady(web, controller)) {
+                fail("Поле ввода DeepSeek не появилось. Проверьте VPN и откройте страницу вручную.")
+                return@launch
+            }
+
+            if (toolLoopOn) {
+                val outcome = runCatching {
+                    controller.runToolLoop(
+                        web = web,
+                        userPrompt = prompt,
+                        policy = DeepSeekWebController.ToolPolicy(enabledTools = enabledTools),
+                        systemPrefix = systemPrefix,
+                        isCancelled = { isRemoteCancelled },
+                        onStatus = { s -> _uiState.update { it.copy(activeToolStatus = s) } },
+                        onPartial = { p -> patchAssistant(p, true) }
+                    )
+                }.getOrNull()
+                if (outcome == null || outcome.failed) {
+                    fail(outcome?.failReason ?: "Сбой цикла инструментов в веб-чате")
+                    return@launch
+                }
+                val text = outcome.finalText.trim()
+                if (text.isEmpty()) {
+                    fail("DeepSeek вернул пустой ответ")
+                    return@launch
+                }
+                patchAssistant(text, false)
+                _uiState.update { it.copy(isGenerating = false, activeToolStatus = null, statusMessage = "") }
+                runCatching { dbHelper.saveMessage(chatId, assistantMessage.copy(text = text, isStreaming = false)) }
+                return@launch
+            }
+
+            val sent = controller.sendMessage(web, prompt)
+            if (!sent) {
+                fail("Не удалось отправить сообщение в веб-чат DeepSeek")
+                return@launch
+            }
+            val answer = controller.waitForAnswer(web, null, onProgress = { p -> patchAssistant(p, true) })
+            val text = answer?.trim().orEmpty()
+            if (text.isEmpty()) {
+                fail("DeepSeek не ответил за отведённое время. Проверьте VPN и повторите.")
+                return@launch
+            }
+            patchAssistant(text, false)
+            _uiState.update { it.copy(isGenerating = false, activeToolStatus = null, statusMessage = "") }
+            runCatching { dbHelper.saveMessage(chatId, assistantMessage.copy(text = text, isStreaming = false)) }
+        }
+    }
+
     fun sendMessage(
         userText: String = _uiState.value.inputText,
         explicitAttachment: AttachedDoc? = null,
@@ -1497,15 +1618,22 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Веб-провайдер без API-ключа: открываем встроенный чат DeepSeek и передаём промпт
+        // Веб-провайдер без API-ключа.
+        // Основной путь: фоновый WebView привязан и пользователь вошёл в аккаунт -
+        // сообщение уходит туда программно, ответ возвращается в обычную ленту чата.
+        // Полноэкранный веб-чат открывается только когда нужен ручной вход.
         if (stateSnapshot.providerType == LLMProviderType.DEEPSEEK_WEB) {
-            _uiState.update {
-                it.copy(
-                    isDeepSeekWebVisible = true,
-                    isBrowserVisible = false,
-                    deepSeekWebSeedPrompt = prompt.trim(),
-                    inputText = ""
-                )
+            if (DeepSeekWebBridge.isBound() && DeepSeekWebBridge.isLoggedIn) {
+                startHiddenWebExchange(prompt, stateSnapshot)
+            } else {
+                _uiState.update {
+                    it.copy(
+                        isDeepSeekWebVisible = true,
+                        isBrowserVisible = false,
+                        deepSeekWebSeedPrompt = prompt.trim(),
+                        inputText = ""
+                    )
+                }
             }
             return
         }

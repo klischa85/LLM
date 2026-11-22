@@ -20,6 +20,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.klischa.llmnotes.web.DeepSeekWebBridge
 import com.klischa.llmnotes.web.DeepSeekWebController
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -70,7 +71,13 @@ fun DeepSeekWebScreen(
     var blankCheck by remember { mutableStateOf(0) }
 
     DisposableEffect(Unit) {
-        onDispose { controller.persistCookies() }
+        onDispose {
+            controller.persistCookies()
+            // Ручной вход/выход завершён: сообщаем мосту актуальное состояние
+            // и просим скрытый фоновый WebView перечитать страницу с новыми куками.
+            DeepSeekWebBridge.updateLoginState(controller.isLoggedIn())
+            DeepSeekWebBridge.requestReload()
+        }
     }
 
     // Системная кнопка «назад» ведёт по истории внутри сайта

@@ -222,6 +222,25 @@ class DeepSeekWebController(private val appContext: Context) {
         runCatching { cookies.flush() }
     }
 
+    /**
+     * Готово ли поле ввода к приёму текста.
+     * Нужно невидимому хосту: проверяем только наличие и доступность textarea,
+     * без геометрии — скрытый WebView может быть отрисован за пределами экрана,
+     * и getBoundingClientRect() там даёт нули, хотя DOM полностью живой.
+     */
+    suspend fun isInputReady(web: WebView): Boolean {
+        val js = """
+            (function(){
+              if (document.readyState !== 'complete') return false;
+              var ta = document.querySelector('textarea');
+              if (!ta) return false;
+              return !ta.disabled && !ta.readOnly;
+            })()
+        """.trimIndent()
+        val raw = evalJs(web, js) ?: return false
+        return raw.removeSurrounding("\"").trim() == "true"
+    }
+
     fun navigateHome(web: WebView) = web.loadUrl(HOME_URL)
 
     /** Вставляет исходный промпт в поле ввода веб-чата (если оно уже отрисовано). */
