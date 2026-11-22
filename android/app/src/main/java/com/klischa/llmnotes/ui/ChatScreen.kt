@@ -566,6 +566,13 @@ fun ChatScreen(
             )
         }
 
+        // Невидимый фоновый веб-чат DeepSeek: страница живёт постоянно,
+        // чтобы сообщения уходили программно, без прыжков в полноэкранный сайт.
+        // Полноэкранный экран монтируется отдельно и только для входа/капчи.
+        if (uiState.providerType == LLMProviderType.DEEPSEEK_WEB && !uiState.isDeepSeekWebVisible) {
+            DeepSeekHiddenHost()
+        }
+
         // Встроенный веб-чат DeepSeek (провайдер без API-ключа)
         if (uiState.isDeepSeekWebVisible) {
             DeepSeekWebScreen(

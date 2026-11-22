@@ -1524,6 +1524,23 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(isGenerating = false, activeToolStatus = null, statusMessage = reason) }
         }
 
+        // Фоновый путь не сработал (страница не готова): показываем причину
+        // в ленте и открываем полноэкранный сайт для ручного входа.
+        fun openWebFallback(reason: String) {
+            if (generationEpoch.get() != myEpoch) return
+            patchAssistant("⚠️ $reason", false)
+            _uiState.update {
+                it.copy(
+                    isGenerating = false,
+                    activeToolStatus = null,
+                    statusMessage = reason,
+                    isDeepSeekWebVisible = true,
+                    isBrowserVisible = false,
+                    deepSeekWebSeedPrompt = prompt.trim()
+                )
+            }
+        }
+
         generationJob = viewModelScope.launch(Dispatchers.IO) {
             val chatId = chatIdSnapshot.ifBlank {
                 val newId = UUID.randomUUID().toString()
@@ -1539,13 +1556,13 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
 
             val pair = DeepSeekWebBridge.awaitReady()
             if (pair == null) {
-                fail("Фоновый веб-чат DeepSeek не готов. Нажмите «Войти» и авторизуйтесь один раз.")
+                openWebFallback("Фоновый веб-чат DeepSeek не готов — нужно один раз войти в аккаунт.")
                 return@launch
             }
             val (web, controller) = pair
 
             if (!DeepSeekWebBridge.awaitInputReady(web, controller)) {
-                fail("Поле ввода DeepSeek не появилось. Проверьте VPN и откройте страницу вручную.")
+                openWebFallback("Поле ввода DeepSeek не появилось — проверьте VPN и войдите в аккаунт.")
                 return@launch
             }
 
@@ -1623,7 +1640,7 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
         // сообщение уходит туда программно, ответ возвращается в обычную ленту чата.
         // Полноэкранный веб-чат открывается только когда нужен ручной вход.
         if (stateSnapshot.providerType == LLMProviderType.DEEPSEEK_WEB) {
-            if (DeepSeekWebBridge.isBound() && DeepSeekWebBridge.isLoggedIn) {
+            if (DeepSeekWebBridge.isBound()) {
                 startHiddenWebExchange(prompt, stateSnapshot)
             } else {
                 _uiState.update {
