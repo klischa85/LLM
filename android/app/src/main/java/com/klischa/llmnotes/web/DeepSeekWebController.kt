@@ -401,6 +401,33 @@ class DeepSeekWebController(private val appContext: Context) {
         }.getOrNull()
     }
 
+    /**
+     * Ждёт, пока страница веб-чата реально отрисуется.
+     *
+     * Симптом из логов 1.4.15: textLen=61-62 символа — это пустой каркас SPA.
+     * Кнопка отправки при этом кликалась и поле очищалось, но запрос не уходил
+     * (draftLen=0, answers=0), а сервер лишь создавал пустой чат.
+     */
+    suspend fun awaitPageReady(web: WebView, timeoutMs: Long = 25_000L): Boolean {
+        val startedAt = System.currentTimeMillis()
+        var lastTextLen = -1
+        var lastUrl = "?"
+        while (System.currentTimeMillis() - startedAt < timeoutMs) {
+            val st = readSubmitState(web)
+            if (st != null) {
+                lastTextLen = st.textLen
+                lastUrl = st.url
+                if (st.textLen > 500 && isInputReady(web)) {
+                    diag("ready: textLen=" + st.textLen + " sendReady=" + st.sendReady + " url=" + st.url)
+                    return true
+                }
+            }
+            delay(300L)
+        }
+        diag("ready: ТАЙМАУТ textLen=" + lastTextLen + " url=" + lastUrl)
+        return false
+    }
+
     /** Сколько блоков ответа ассистента сейчас на странице. */
     suspend fun countAnswers(web: WebView): Int = readSubmitState(web)?.answers ?: 0
 
@@ -410,9 +437,13 @@ class DeepSeekWebController(private val appContext: Context) {
      * поле ввода очистилось. Без этой проверки форма могла молча
      * не отправиться, и приложение висело в ожидании до общего таймаута.
      */
-    // 35 с: при «Глубоком размышлении» ответ приходит заметно позже 12 с,
-    // и прежний таймаут давал ложный отказ при уже начавшейся генерации.
-    suspend fun sendMessageChecked(web: WebView, text: String, timeoutMs: Long = 35_000L): SubmitReport {
+    // 60 с: в логах 1.4.15 отказы упирались в 35 с при ещё не отрисованной
+    // странице (textLen 61-62). Теперь ждём готовность страницы ДО клика,
+    // поэтому бюджет увеличен: до 25 с на отрисовку + запас на отправку.
+    suspend fun sendMessageChecked(web: WebView, text: String, timeoutMs: Long = 60_000L): SubmitReport {
+        // Фаза 1: страница должна быть отрисована. Иначе клик уходит в пустой
+        // каркас SPA, поле формально очищается, а запрос на сервер не уходит.
+        awaitPageReady(web)
         if (text.isBlank()) return SubmitReport(false, "Пустой запрос")
         val before = countAnswers(web)
         if (!seedPrompt(web, text)) {
@@ -480,17 +511,26 @@ class DeepSeekWebController(private val appContext: Context) {
             .takeIf { it.isNotBlank() && it != "null" }
     }
 
-    /** Признак идущей генерации: кнопка Stop видна в поле ввода. */
+    /**
+     * Признак идущей генерации.
+     *
+     * ВАЖНО: прежняя версия отбрасывала элементы по getBoundingClientRect().
+     * В фоновом хосте (offset -10000dp) геометрия вырождена, все размеры нулевые,
+     * поэтому цикл не доходил ни до одной кнопки и busy не становился true НИКОГДА
+     * (в логе 1.4.15 busy=false во всех четырёх запросах, включая успешный).
+     * Теперь проверка только по DOM: квадратная иконка Stop (svg с rect и без path).
+     */
     private val GENERATING_JS = """
         (function(){
           const nodes = Array.from(document.querySelectorAll('div[role="button"], button'));
           for (const n of nodes) {
-            const r = n.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) continue;
             const l = (n.getAttribute('aria-label') || '').toLowerCase();
             const c = (n.className || '').toString().toLowerCase();
             if (l.indexOf('stop') >= 0 || l.indexOf('останов') >= 0) return true;
             if (c.indexOf('stop') >= 0) return true;
+            const svg = n.querySelector('svg');
+            if (!svg) continue;
+            if (svg.querySelector('rect') && !svg.querySelector('path')) return true;
           }
           return false;
         })()

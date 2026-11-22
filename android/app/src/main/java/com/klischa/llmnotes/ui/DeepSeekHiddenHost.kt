@@ -56,10 +56,19 @@ fun DeepSeekHiddenHost() {
         modifier = Modifier
             .size(width = 420.dp, height = 900.dp)
             .offset(x = (-10000).dp)
-            .alpha(0f),
+            // alpha 0f делало окно невидимым для рендерера: Chrome троттлит
+            // отрисовку таких View, и SPA DeepSeek оставался пустым каркасом
+            // (textLen 61-62 в логах 1.4.15). 0.01f визуально неразличимо,
+            // но окно остаётся «видимым» и рисуется полноценно.
+            .alpha(0.01f),
         factory = { ctx ->
             WebView(ctx.applicationContext).also { web ->
                 controller.configure(web)
+                // Просим не понижать приоритет рендерера: иначе в фоне страница
+                // не догружается до нормального DOM (API 26+, minSdk 26).
+                runCatching {
+                    web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+                }
                 DeepSeekWebBridge.bind(web, controller)
                 web.loadUrl(DeepSeekWebController.HOME_URL)
                 webView = web
