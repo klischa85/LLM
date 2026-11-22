@@ -171,6 +171,15 @@ class DeepSeekWebController(private val appContext: Context) {
         }
     }
 
+    /** Диагностический лог в общий каталог: читается без root и adb. */
+    private fun diag(msg: String) {
+        runCatching {
+            val f = java.io.File("/storage/emulated/0/Download/llmnotes_deepseek.log")
+            if (f.length() > 512_000L) f.delete()
+            f.appendText(System.currentTimeMillis().toString() + " " + msg + "\n")
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     fun configure(
         web: WebView,
@@ -340,6 +349,7 @@ class DeepSeekWebController(private val appContext: Context) {
         // и приложение висело в ожидании ответа до самого таймаута.
         val draftAfterSeed = readSubmitState(web)?.draftLen ?: 0
         Log.d(TAG, "sendMessageChecked: вставлено=" + text.length + ", черновик=" + draftAfterSeed)
+        diag("send: вставлено=" + text.length + " черновик=" + draftAfterSeed + " answersBefore=" + before)
         if (draftAfterSeed <= 0) {
             return SubmitReport(false, "DeepSeek не принял текст в поле ввода — страница не готова")
         }
@@ -352,6 +362,7 @@ class DeepSeekWebController(private val appContext: Context) {
             if (st.busy) return SubmitReport(true)
             // draftLen == 0 сам по себе НЕ доказывает отправку: поле могло быть пустым изначально
         }
+        diag("send: FAIL submitted=" + submitted)
         val reason = if (submitted)
             "Сообщение не ушло: DeepSeek не отреагировал на отправку. Проверьте VPN и вход в аккаунт."
         else
@@ -401,10 +412,12 @@ class DeepSeekWebController(private val appContext: Context) {
         onProgress: (String) -> Unit = {}
     ): String? {
         val baseline = previousText.orEmpty()
+        diag("wait: старт baselineLen=" + baseline.length)
         val startedAt = System.currentTimeMillis()
         var lastText = ""
         var lastChangeAt = System.currentTimeMillis()
         var sawAnyText = false
+        var polls = 0
 
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
             delay(POLL_INTERVAL_MS)
@@ -420,20 +433,29 @@ class DeepSeekWebController(private val appContext: Context) {
             }
 
             val generating = evalJs(web, GENERATING_JS.trimIndent())?.trim() == "true"
+            polls++
+            if (polls % 10 == 0) diag("wait: polls=" + polls + " len=" + current.length + " gen=" + generating + " sawAny=" + sawAnyText)
             val stableFor = System.currentTimeMillis() - lastChangeAt
             
             // Готово, если текст отличается от исходного и стабилен достаточно долго
             if (sawAnyText && stableFor >= STABLE_MS) {
                 // при явном индикаторе генерации ждём ещё, но не дольше остатка таймаута
                 if (generating) continue
+                diag("wait: готово по стабильности len=" + lastText.length)
                 return lastText
             }
-            // Резервный выход: индикатора нет, текст не менялся дольше жёсткого порога
-            if (!generating && sawAnyText && stableFor >= HARD_STABLE_MS) {
+            // Резервный выход: текст не менялся дольше жёсткого порога.
+            // ВАЖНО: не зависит от индикатора генерации. Кнопка Stop могла «залипнуть»
+            // (селектор находит подстроку stop в class/aria-label любого элемента),
+            // и тогда условие !generating делало выход невозможным: чат ждал
+            // до самого таймаута при давно готовом ответе.
+            if (sawAnyText && stableFor >= HARD_STABLE_MS) {
+                diag("wait: выход по стабильности (gen=" + generating + ") len=" + lastText.length)
                 return lastText
             }
         }
         val tail = lastText.takeIf { it.isNotBlank() && it != baseline }
+        diag("wait: ТАЙМАУТ len=" + lastText.length + " sawAny=" + sawAnyText)
         Log.w(TAG, "waitForAnswer: таймаут " + timeoutMs + " мс, получено " + (tail?.length ?: 0) + " символов, видели текст: " + sawAnyText)
         return tail
     }
