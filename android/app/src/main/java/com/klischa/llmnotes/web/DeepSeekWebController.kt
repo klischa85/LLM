@@ -106,27 +106,43 @@ class DeepSeekWebController(private val appContext: Context) {
             })()
 """
 
-        /** Нажатие кнопки отправки: три стратегии, последняя — синтетический Enter. */
+        /**
+         * Нажатие кнопки отправки.
+         *
+         * Почему не по aria-label: проверено на живой странице chat.deepseek.com —
+         * у всех 81 кнопки атрибут aria-label пуст, поэтому ветка поиска по подписи
+         * не срабатывала никогда.
+         *
+         * Почему не по координатам: в фоновом WebView (alpha 0f, offset -10000dp)
+         * геометрия вырождается, все расстояния становятся равны нулю и «ближайшей»
+         * оказывается первая кнопка в списке (меню в шапке). Клик уходил в пустышку,
+         * но код всё равно возвращал 'click', а вызывающая сторона считала отправку
+         * состоявшейся — отсюда повторяющееся "FAIL submitted=true" в логе.
+         *
+         * Единственный устойчивый признак кнопки отправки — её классы
+         * ds-button--primary + ds-button--filled; у заблокированной добавляется
+         * ds-button--disabled (на живой странице такая ровно одна, и после вставки
+         * текста класс снимается).
+         *
+         * Коды: click — нажали, enter — отправили синтетическим Enter,
+         * disabled — кнопка заблокирована, no-input / no-button — нечего нажимать.
+         */
         private val SUBMIT_JS = """
             (function(){
               const ta = document.querySelector('textarea');
               if (!ta) return 'no-input';
               const nodes = Array.from(document.querySelectorAll('div[role="button"], button'));
-              const visible = nodes.filter(function(n){ return !!n.querySelector('svg'); });
-              const labelled = visible.find(function(n){
-                const l = (n.getAttribute('aria-label') || '').toLowerCase();
-                return l.indexOf('send') >= 0 || l.indexOf('отправ') >= 0;
+              const senders = nodes.filter(function(n){
+                const c = (n.className || '').toString();
+                return c.indexOf('ds-button--primary') >= 0 && c.indexOf('ds-button--filled') >= 0;
               });
-              if (labelled) { labelled.click(); return 'click'; }
-              const tr = ta.getBoundingClientRect();
-              let best = null, bestDist = Infinity;
-              visible.forEach(function(n){
-                const r = n.getBoundingClientRect();
-                const d = Math.abs(r.top - tr.top) + Math.abs(r.left - (tr.right - r.width / 2));
-                if (d < bestDist) { bestDist = d; best = n; }
+              const enabled = senders.find(function(n){
+                return (n.className || '').toString().indexOf('ds-button--disabled') < 0;
               });
-              if (best) { best.click(); return 'click'; }
+              if (enabled) { enabled.click(); return 'click'; }
+              if (senders.length) return 'disabled';
               const ev = new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true});
+              ta.focus();
               ta.dispatchEvent(ev);
               return 'enter';
             })()
@@ -305,11 +321,17 @@ class DeepSeekWebController(private val appContext: Context) {
         return res?.trim() == "true"
     }
 
-    /** Нажимает кнопку отправки. Возвращает true, если удалось отправить. */
-    suspend fun submitPrompt(web: WebView): Boolean {
+    /**
+     * Нажимает кнопку отправки и возвращает код результата:
+     * "click" — кнопка нажата, "enter" — отправлено синтетическим Enter,
+     * "disabled" — кнопка отправки заблокирована, "no-input" / "no-button" —
+     * нажимать нечего. Разделение важно: раньше любой клик (даже по чужой
+     * кнопке) давал true, и вызывающая сторона не могла отличить отправку
+     * от промаха.
+     */
+    suspend fun submitPrompt(web: WebView): String {
         val res = evalJs(web, SUBMIT_JS.trimIndent())
-        val clean = res?.removeSurrounding("\"")?.trim()
-        return clean == "click" || clean == "enter"
+        return res?.removeSurrounding("\"")?.trim().orEmpty()
     }
 
     /** Итог отправки сообщения в веб-чат: причина отказа видна пользователю. */
@@ -354,19 +376,39 @@ class DeepSeekWebController(private val appContext: Context) {
             return SubmitReport(false, "DeepSeek не принял текст в поле ввода — страница не готова")
         }
         val submitted = submitPrompt(web)
+        diag("send: submit=" + submitted)
+        // Разбираем код ДО ожидания: часть кодов означает, что нажимать было нечего.
+        // Раньше любой клик давал "непустую строку" и превращался в общую отписку про VPN.
+        if (submitted.isEmpty()) {
+            return SubmitReport(false, "Кнопка отправки DeepSeek не найдена — страница не готова")
+        }
+        if (submitted == "no-input") {
+            return SubmitReport(false, "Поле ввода DeepSeek не найдено на странице")
+        }
+        if (submitted == "disabled") {
+            return SubmitReport(false, "Кнопка отправки DeepSeek заблокирована: текст не принят полем ввода")
+        }
         val startedAt = System.currentTimeMillis()
+        // Признак того, что поле реально очистилось после нажатия. Сам по себе
+        // не доказывает отправку (поле могло быть пустым изначально), но вместе
+        // с отсутствием роста answers уточняет причину отказа.
+        var sawDraftClear = false
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
             delay(500L)
             val st = readSubmitState(web) ?: continue
             if (st.answers > before) return SubmitReport(true)
             if (st.busy) return SubmitReport(true)
-            // draftLen == 0 сам по себе НЕ доказывает отправку: поле могло быть пустым изначально
+            if (st.draftLen == 0) sawDraftClear = true
         }
-        diag("send: FAIL submitted=" + submitted)
-        val reason = if (submitted)
-            "Сообщение не ушло: DeepSeek не отреагировал на отправку. Проверьте VPN и вход в аккаунт."
-        else
-            "Кнопка отправки DeepSeek недоступна — страница не готова."
+        diag("send: FAIL submit=" + submitted + " sawDraftClear=" + sawDraftClear + " answersBefore=" + before)
+        val reason = when {
+            submitted == "enter" && !sawDraftClear ->
+                "Enter не отправил сообщение: поле ввода не очистилось. Откройте чат DeepSeek вручную и нажмите «Отправить»"
+            sawDraftClear ->
+                "Текст принят и поле очистилось, но ответ не начал генерироваться. Проверьте VPN и вход в аккаунт."
+            else ->
+                "Кнопка отправки нажата, но поле ввода не очистилось — DeepSeek не принял запрос. Проверьте VPN и вход в аккаунт."
+        }
         return SubmitReport(false, reason)
     }
 
