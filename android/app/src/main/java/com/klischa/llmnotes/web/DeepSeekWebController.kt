@@ -94,15 +94,36 @@ class DeepSeekWebController(private val appContext: Context) {
             (function(){
               const md = document.querySelectorAll('[class*="ds-markdown"]');
               const nodes = Array.from(document.querySelectorAll('div[role="button"], button'));
-              let busy = false;
-              for (const n of nodes) {
-                const l = (n.getAttribute('aria-label') || '').toLowerCase();
-                const c = (n.className || '').toString().toLowerCase();
-                if (l.indexOf('stop') >= 0 || c.indexOf('stop') >= 0) { busy = true; break; }
-              }
               const ta = document.querySelector('textarea');
               const draft = ta ? (ta.value || '') : '';
-              return JSON.stringify({answers: md.length, busy: busy, draftLen: draft.length});
+
+              // Кнопка Stop на chat.deepseek.com не содержит слова stop ни в классе,
+              // ни в aria-label (он пуст у всех кнопок). Её выдаёт квадратная иконка:
+              // svg с rect и без path. Раньше busy не становился true никогда,
+              // поэтому живой ответ считался неудачной отправкой.
+              let busy = false;
+              for (const n of nodes) {
+                const svg = n.querySelector('svg');
+                if (!svg) continue;
+                if (svg.querySelector('rect') && !svg.querySelector('path')) { busy = true; break; }
+              }
+              // Кнопка отправки активна, если primary-кнопка не помечена disabled.
+              let sendReady = false;
+              for (const n of nodes) {
+                const c = (n.className || '').toString();
+                if (c.indexOf('ds-button--primary') < 0) continue;
+                if (c.indexOf('disabled') >= 0) continue;
+                sendReady = true; break;
+              }
+              return JSON.stringify({
+                answers: md.length,
+                busy: busy,
+                draftLen: draft.length,
+                sendReady: sendReady,
+                vis: document.visibilityState || '',
+                url: (location.href || '').slice(0, 80),
+                textLen: (document.body ? (document.body.innerText || '').length : 0)
+              });
             })()
 """
 
@@ -194,6 +215,20 @@ class DeepSeekWebController(private val appContext: Context) {
             if (f.length() > 512_000L) f.delete()
             f.appendText(System.currentTimeMillis().toString() + " " + msg + "\n")
         }
+    }
+
+    /** Расширенное состояние фоновой страницы: видно, что именно видит невидимый WebView. */
+    private suspend fun diagState(web: WebView, tag: String) {
+        val st = readSubmitState(web)
+        diag(
+            "state[" + tag + "]: answers=" + (st?.answers ?: -1) +
+                " busy=" + (st?.busy ?: false) +
+                " draftLen=" + (st?.draftLen ?: -1) +
+                " sendReady=" + (st?.sendReady ?: false) +
+                " vis=" + (st?.vis ?: "?") +
+                " textLen=" + (st?.textLen ?: -1) +
+                " url=" + (st?.url ?: "?")
+        )
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -337,7 +372,15 @@ class DeepSeekWebController(private val appContext: Context) {
     /** Итог отправки сообщения в веб-чат: причина отказа видна пользователю. */
     data class SubmitReport(val ok: Boolean, val reason: String = "")
 
-    private data class SubmitState(val answers: Int, val busy: Boolean, val draftLen: Int)
+    private data class SubmitState(
+        val answers: Int,
+        val busy: Boolean,
+        val draftLen: Int,
+        val sendReady: Boolean = false,
+        val vis: String = "",
+        val url: String = "",
+        val textLen: Int = 0
+    )
 
     private suspend fun readSubmitState(web: WebView): SubmitState? {
         val raw = evalJs(web, SUBMIT_CHECK_JS.trimIndent()) ?: return null
@@ -346,7 +389,15 @@ class DeepSeekWebController(private val appContext: Context) {
             .replace("\\\\", "\\")
         return runCatching {
             val o = JSONObject(json)
-            SubmitState(o.optInt("answers"), o.optBoolean("busy"), o.optInt("draftLen"))
+            SubmitState(
+                answers = o.optInt("answers"),
+                busy = o.optBoolean("busy"),
+                draftLen = o.optInt("draftLen"),
+                sendReady = o.optBoolean("sendReady"),
+                vis = o.optString("vis"),
+                url = o.optString("url"),
+                textLen = o.optInt("textLen")
+            )
         }.getOrNull()
     }
 
@@ -359,7 +410,9 @@ class DeepSeekWebController(private val appContext: Context) {
      * поле ввода очистилось. Без этой проверки форма могла молча
      * не отправиться, и приложение висело в ожидании до общего таймаута.
      */
-    suspend fun sendMessageChecked(web: WebView, text: String, timeoutMs: Long = 12_000L): SubmitReport {
+    // 35 с: при «Глубоком размышлении» ответ приходит заметно позже 12 с,
+    // и прежний таймаут давал ложный отказ при уже начавшейся генерации.
+    suspend fun sendMessageChecked(web: WebView, text: String, timeoutMs: Long = 35_000L): SubmitReport {
         if (text.isBlank()) return SubmitReport(false, "Пустой запрос")
         val before = countAnswers(web)
         if (!seedPrompt(web, text)) {
@@ -401,6 +454,7 @@ class DeepSeekWebController(private val appContext: Context) {
             if (st.draftLen == 0) sawDraftClear = true
         }
         diag("send: FAIL submit=" + submitted + " sawDraftClear=" + sawDraftClear + " answersBefore=" + before)
+        diagState(web, "send-FAIL")
         val reason = when {
             submitted == "enter" && !sawDraftClear ->
                 "Enter не отправил сообщение: поле ввода не очистилось. Откройте чат DeepSeek вручную и нажмите «Отправить»"
@@ -498,6 +552,7 @@ class DeepSeekWebController(private val appContext: Context) {
         }
         val tail = lastText.takeIf { it.isNotBlank() && it != baseline }
         diag("wait: ТАЙМАУТ len=" + lastText.length + " sawAny=" + sawAnyText)
+        diagState(web, "wait-TIMEOUT")
         Log.w(TAG, "waitForAnswer: таймаут " + timeoutMs + " мс, получено " + (tail?.length ?: 0) + " символов, видели текст: " + sawAnyText)
         return tail
     }
