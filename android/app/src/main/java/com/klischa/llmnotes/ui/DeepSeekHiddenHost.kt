@@ -2,6 +2,7 @@ package com.klischa.llmnotes.ui
 
 import android.annotation.SuppressLint
 import android.webkit.WebView
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -22,7 +23,8 @@ import com.klischa.llmnotes.web.DeepSeekWebController
  *
  * Зачем: раньше каждое сообщение при провайдере DEEPSEEK_WEB открывало
  * полноэкранный сайт, и приходилось прыгать между нативным чатом и им.
- * Теперь страница живёт здесь постоянно (2x2 dp, alpha 0, касания не ловит),
+ * Теперь страница живёт здесь постоянно (реальный размер, сдвинут за край экрана,
+ * alpha 0, касания не ловит),
  * ViewModel отправляет в неё текст через [DeepSeekWebBridge], а ответ
  * возвращается в обычную ленту чата.
  *
@@ -47,8 +49,13 @@ fun DeepSeekHiddenHost() {
     }
 
     AndroidView(
+        // ВАЖНО: размер должен быть реальным. При 2x2 dp вьюпорт страницы
+        // сжимался до нескольких пикселей, React-вёрстка DeepSeek не отрисовывала
+        // кнопку отправки, форма молча не отправлялась — и чат «висел» в ожидании.
+        // Поэтому даём нормальный размер и уводим окно далеко за левый край экрана.
         modifier = Modifier
-            .size(2.dp)
+            .size(width = 420.dp, height = 900.dp)
+            .offset(x = (-10000).dp)
             .alpha(0f),
         factory = { ctx ->
             WebView(ctx.applicationContext).also { web ->

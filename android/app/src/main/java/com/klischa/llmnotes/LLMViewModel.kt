@@ -1593,12 +1593,17 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            val sent = controller.sendMessage(web, prompt)
-            if (!sent) {
-                fail("Не удалось отправить сообщение в веб-чат DeepSeek")
+            // Проверяем не только клик, но и факт отправки: иначе форма могла
+            // молча не уйти, и пользователь видел вечное ожидание ответа.
+            // Запоминаем текст последнего ответа ДО отправки: иначе старый ответ
+            // с прошлого запроса принимался за новый, и чат «висел» в ожидании.
+            val baseline = runCatching { controller.readLastAnswer(web) }.getOrNull()
+            val sendReport = controller.sendMessageChecked(web, prompt)
+            if (!sendReport.ok) {
+                fail(sendReport.reason.ifBlank { "Не удалось отправить сообщение в веб-чат DeepSeek" })
                 return@launch
             }
-            val answer = controller.waitForAnswer(web, null, onProgress = { p -> patchAssistant(p, true) })
+            val answer = controller.waitForAnswer(web, baseline, onProgress = { p -> patchAssistant(p, true) })
             val text = answer?.trim().orEmpty()
             if (text.isEmpty()) {
                 fail("DeepSeek не ответил за отведённое время. Проверьте VPN и повторите.")

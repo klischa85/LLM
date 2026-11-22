@@ -7,6 +7,7 @@ import android.net.Uri
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
+import android.util.Log
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.klischa.llmnotes.AgentTools
@@ -14,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import kotlin.coroutines.resume
 
@@ -32,10 +34,13 @@ class DeepSeekWebController(private val appContext: Context) {
     companion object {
         const val HOME_URL = "https://chat.deepseek.com"
         private const val HOST = "chat.deepseek.com"
+        private const val TAG = "DeepSeekWeb"
         private const val POLL_INTERVAL_MS = 400L
+        /** Предохранитель на один вызов JS: колбэк evaluateJavascript может не прийти. */
+        private const val EVAL_TIMEOUT_MS = 8_000L
         const val STABLE_MS = 2_500L
         const val HARD_STABLE_MS = 6_000L
-        const val TIMEOUT_MS = 90_000L
+        const val TIMEOUT_MS = 60_000L
         const val MAX_OBSERVATION_CHARS = 6_000
         /** Инструменты, включённые по умолчанию: только чтение, без записи и Termux. */
         val DEFAULT_SAFE_TOOLS: Set<String> =
@@ -52,18 +57,54 @@ class DeepSeekWebController(private val appContext: Context) {
 
         /** Вставка текста в textarea с обходом React-контроля значения. */
         private val SEED_INPUT_JS = """
+        (function(){
+          const ta = document.querySelector('textarea');
+          if (!ta) return false;
+          const val = %s;
+          function setNative(el, v) {
+            const proto = window.HTMLTextAreaElement.prototype;
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) desc.set.call(el, v); else el.value = v;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          ta.focus();
+          setNative(ta, val);
+          // React часто игнорирует нативный сеттер: пробуем вставку через execCommand
+          // и событие paste, иначе поле остаётся пустым и отправлять нечего.
+          if (!(ta.value || '').length) {
+            try { document.execCommand('insertText', false, val); } catch (e) {}
+          }
+          if (!(ta.value || '').length) {
+            try {
+              const dt = new DataTransfer();
+              dt.setData('text/plain', val);
+              ta.dispatchEvent(new ClipboardEvent('paste', {
+                clipboardData: dt, bubbles: true, cancelable: true
+              }));
+            } catch (e) {}
+          }
+          return (ta.value || '').length > 0;
+        })()
+    """
+
+
+        /** Состояние страницы после отправки: число ответов, генерация, черновик. */
+        private val SUBMIT_CHECK_JS = """
             (function(){
+              const md = document.querySelectorAll('[class*="ds-markdown"]');
+              const nodes = Array.from(document.querySelectorAll('div[role="button"], button'));
+              let busy = false;
+              for (const n of nodes) {
+                const l = (n.getAttribute('aria-label') || '').toLowerCase();
+                const c = (n.className || '').toString().toLowerCase();
+                if (l.indexOf('stop') >= 0 || c.indexOf('stop') >= 0) { busy = true; break; }
+              }
               const ta = document.querySelector('textarea');
-              if (!ta) return false;
-              const proto = window.HTMLTextAreaElement.prototype;
-              const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-              if (desc && desc.set) desc.set.call(ta, %s); else ta.value = %s;
-              ta.dispatchEvent(new Event('input', { bubbles: true }));
-              ta.dispatchEvent(new Event('change', { bubbles: true }));
-              ta.focus();
-              return true;
+              const draft = ta ? (ta.value || '') : '';
+              return JSON.stringify({answers: md.length, busy: busy, draftLen: draft.length});
             })()
-        """
+"""
 
         /** Нажатие кнопки отправки: три стратегии, последняя — синтетический Enter. */
         private val SUBMIT_JS = """
@@ -71,10 +112,7 @@ class DeepSeekWebController(private val appContext: Context) {
               const ta = document.querySelector('textarea');
               if (!ta) return 'no-input';
               const nodes = Array.from(document.querySelectorAll('div[role="button"], button'));
-              const visible = nodes.filter(function(n){
-                const r = n.getBoundingClientRect();
-                return r.width > 0 && r.height > 0 && n.querySelector('svg');
-              });
+              const visible = nodes.filter(function(n){ return !!n.querySelector('svg'); });
               const labelled = visible.find(function(n){
                 const l = (n.getAttribute('aria-label') || '').toLowerCase();
                 return l.indexOf('send') >= 0 || l.indexOf('отправ') >= 0;
@@ -119,11 +157,17 @@ class DeepSeekWebController(private val appContext: Context) {
     private val cookies: CookieManager get() = CookieManager.getInstance()
 
     /** Универсальный запуск JS в WebView с обязательным переключением на main-поток. */
-    private suspend fun evalJs(web: WebView, script: String): String? = withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine { cont ->
-            runCatching {
-                web.evaluateJavascript(script) { r -> if (cont.isActive) cont.resume(r) }
-            }.onFailure { if (cont.isActive) cont.resume(null) }
+    private suspend fun evalJs(
+        web: WebView,
+        script: String,
+        timeoutMs: Long = EVAL_TIMEOUT_MS
+    ): String? = withTimeoutOrNull(timeoutMs) {
+        withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine { cont ->
+                runCatching {
+                    web.evaluateJavascript(script) { r -> if (cont.isActive) cont.resume(r) }
+                }.onFailure { if (cont.isActive) cont.resume(null) }
+            }
         }
     }
 
@@ -259,12 +303,64 @@ class DeepSeekWebController(private val appContext: Context) {
         return clean == "click" || clean == "enter"
     }
 
-    /** Вставляет текст и сразу отправляет его. */
-    suspend fun sendMessage(web: WebView, text: String): Boolean {
-        if (!seedPrompt(web, text)) return false
-        delay(250)
-        return submitPrompt(web)
+    /** Итог отправки сообщения в веб-чат: причина отказа видна пользователю. */
+    data class SubmitReport(val ok: Boolean, val reason: String = "")
+
+    private data class SubmitState(val answers: Int, val busy: Boolean, val draftLen: Int)
+
+    private suspend fun readSubmitState(web: WebView): SubmitState? {
+        val raw = evalJs(web, SUBMIT_CHECK_JS.trimIndent()) ?: return null
+        val json = raw.removeSurrounding("\"")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+        return runCatching {
+            val o = JSONObject(json)
+            SubmitState(o.optInt("answers"), o.optBoolean("busy"), o.optInt("draftLen"))
+        }.getOrNull()
     }
+
+    /** Сколько блоков ответа ассистента сейчас на странице. */
+    suspend fun countAnswers(web: WebView): Int = readSubmitState(web)?.answers ?: 0
+
+    /**
+     * Отправляет текст и убеждается, что запрос действительно ушёл:
+     * выросло число блоков ответа, появился индикатор генерации или
+     * поле ввода очистилось. Без этой проверки форма могла молча
+     * не отправиться, и приложение висело в ожидании до общего таймаута.
+     */
+    suspend fun sendMessageChecked(web: WebView, text: String, timeoutMs: Long = 12_000L): SubmitReport {
+        if (text.isBlank()) return SubmitReport(false, "Пустой запрос")
+        val before = countAnswers(web)
+        if (!seedPrompt(web, text)) {
+            return SubmitReport(false, "Поле ввода DeepSeek не найдено на странице")
+        }
+        delay(250L)
+        // Пустой черновик после вставки = React не принял текст (поле пересоздалось
+        // или страница не готова). Раньше это ошибочно считалось успешной отправкой,
+        // и приложение висело в ожидании ответа до самого таймаута.
+        val draftAfterSeed = readSubmitState(web)?.draftLen ?: 0
+        Log.d(TAG, "sendMessageChecked: вставлено=" + text.length + ", черновик=" + draftAfterSeed)
+        if (draftAfterSeed <= 0) {
+            return SubmitReport(false, "DeepSeek не принял текст в поле ввода — страница не готова")
+        }
+        val submitted = submitPrompt(web)
+        val startedAt = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startedAt < timeoutMs) {
+            delay(500L)
+            val st = readSubmitState(web) ?: continue
+            if (st.answers > before) return SubmitReport(true)
+            if (st.busy) return SubmitReport(true)
+            // draftLen == 0 сам по себе НЕ доказывает отправку: поле могло быть пустым изначально
+        }
+        val reason = if (submitted)
+            "Сообщение не ушло: DeepSeek не отреагировал на отправку. Проверьте VPN и вход в аккаунт."
+        else
+            "Кнопка отправки DeepSeek недоступна — страница не готова."
+        return SubmitReport(false, reason)
+    }
+
+    /** Вставляет текст, отправляет и проверяет, что запрос действительно ушёл. */
+    suspend fun sendMessage(web: WebView, text: String): Boolean = sendMessageChecked(web, text).ok
 
     /** Извлекает текст последнего ответа ассистента: три стратегии по очереди. */
     suspend fun readLastAnswer(web: WebView): String? {
@@ -337,7 +433,9 @@ class DeepSeekWebController(private val appContext: Context) {
                 return lastText
             }
         }
-        return lastText.takeIf { it.isNotBlank() && it != baseline }
+        val tail = lastText.takeIf { it.isNotBlank() && it != baseline }
+        Log.w(TAG, "waitForAnswer: таймаут " + timeoutMs + " мс, получено " + (tail?.length ?: 0) + " символов, видели текст: " + sawAnyText)
+        return tail
     }
 
     /** Разрешённые пользователем инструменты (имена из AgentTools). */
@@ -373,19 +471,20 @@ class DeepSeekWebController(private val appContext: Context) {
         onPartial: (String) -> Unit = {}
     ): ToolLoopOutcome {
         var callsUsed = 0
-        var lastAnswer: String? = null
+        var lastAnswer: String? = runCatching { readLastAnswer(web) }.getOrNull()
         var finalText = ""
 
         val firstMessage = if (systemPrefix.isBlank()) userPrompt
                            else systemPrefix.trimEnd() + "\n\n" + userPrompt
 
-        if (!sendMessage(web, firstMessage)) {
+        val firstReport = sendMessageChecked(web, firstMessage)
+        if (!firstReport.ok) {
             return ToolLoopOutcome(
                 finalText = "",
                 iterations = 0,
                 calls = 0,
                 failed = true,
-                failReason = "Не удалось вставить текст в поле ввода веб-чата"
+                failReason = firstReport.reason
             )
         }
 
@@ -447,13 +546,14 @@ class DeepSeekWebController(private val appContext: Context) {
             val followUp = "Результаты инструментов:\n" + observations.toString() +
                 "\nПродолжай: если задача решена — дай итоговый ответ пользователю без вызовов инструментов."
 
-            if (!sendMessage(web, followUp)) {
+            val followReport = sendMessageChecked(web, followUp)
+            if (!followReport.ok) {
                 return ToolLoopOutcome(
                     finalText = finalText,
                     iterations = iteration,
                     calls = callsUsed,
                     failed = true,
-                    failReason = "Не удалось отправить результаты инструментов в веб-чат"
+                    failReason = followReport.reason
                 )
             }
         }
