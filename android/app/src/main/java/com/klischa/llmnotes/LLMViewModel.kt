@@ -1624,10 +1624,10 @@ class LLMViewModel(application: Application) : AndroidViewModel(application) {
                 fail(sendReport.reason.ifBlank { "Не удалось отправить сообщение в веб-чат DeepSeek" })
                 return@launch
             }
-            val answer = controller.waitForAnswer(web, baseline, onProgress = { p -> patchAssistant(p, true) })
+            val answer = controller.waitForAnswer(web, baseline, onProgress = { p -> patchAssistant(p, true) }, sentPrompt = prompt)
             val text = answer?.trim().orEmpty()
             if (text.isEmpty()) {
-                fail("DeepSeek не ответил за отведённое время. Проверьте VPN и повторите.")
+                fail("Не удалось прочитать ответ DeepSeek за отведённое время. Ответ мог прийти — откройте веб-чат кнопкой «🌐» и проверьте.")
                 return@launch
             }
             patchAssistant(text, false)

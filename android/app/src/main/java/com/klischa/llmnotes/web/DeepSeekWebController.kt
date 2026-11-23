@@ -37,10 +37,10 @@ class DeepSeekWebController(private val appContext: Context) {
         private const val TAG = "DeepSeekWeb"
         private const val POLL_INTERVAL_MS = 400L
         /** Предохранитель на один вызов JS: колбэк evaluateJavascript может не прийти. */
-        private const val EVAL_TIMEOUT_MS = 8_000L
+        private const val EVAL_TIMEOUT_MS = 12_000L
         const val STABLE_MS = 2_500L
         const val HARD_STABLE_MS = 6_000L
-        const val TIMEOUT_MS = 60_000L
+        const val TIMEOUT_MS = 180_000L
         const val MAX_OBSERVATION_CHARS = 6_000
         /** Инструменты, включённые по умолчанию: только чтение, без записи и Termux. */
         val DEFAULT_SAFE_TOOLS: Set<String> =
@@ -171,6 +171,59 @@ class DeepSeekWebController(private val appContext: Context) {
             })()
         """
 
+
+        /**
+         * Один опрос на цикл ожидания: текст ответа, длина body и признак генерации.
+         *
+         * Зачем заменили пару EXTRACT_JS + GENERATING_JS: два evaluateJavascript на
+         * каждый опрос не укладывались в таймаут при стриминге, обещание не
+         * резолвилось, текст читался как пустой (len=0 на всех опросах).
+         *
+         * Второй заслон: если блоки ответа не нашлись по классам, текст берётся из
+         * body.innerText как хвост после предыдущего ответа (BASE) или после самого
+         * вопроса (SENT). Тогда ответ читается даже при смене разметки DeepSeek.
+         */
+        private val WAIT_PROBE_JS = """
+            (function(){
+              const BASE_RAW = __BASE__;
+              const SENT_RAW = __SENT__;
+              let txt = '';
+              const sels = ['[class*="ds-markdown"]', '[class*="markdown"]', '[class*="message"]'];
+              for (const sel of sels) {
+                try {
+                  const n = document.querySelectorAll(sel);
+                  if (n.length) {
+                    const t = (n[n.length - 1].innerText || '').trim();
+                    if (t.length > 1) { txt = t; break; }
+                  }
+                } catch (e) {}
+              }
+              const body = document.body ? (document.body.innerText || '') : '';
+              if (txt.length < 2 && body) {
+                let cut = -1;
+                let cutLen = 0;
+                if (BASE_RAW && BASE_RAW.length > 1) {
+                  const i = body.lastIndexOf(BASE_RAW);
+                  if (i >= 0) { cut = i; cutLen = BASE_RAW.length; }
+                }
+                if (cut < 0 && SENT_RAW && SENT_RAW.length > 1) {
+                  const i = body.lastIndexOf(SENT_RAW);
+                  if (i >= 0) { cut = i; cutLen = SENT_RAW.length; }
+                }
+                if (cut >= 0) txt = body.slice(cut + cutLen).trim();
+              }
+              let gen = false;
+              try {
+                const nodes = document.querySelectorAll('div[role="button"], button');
+                for (const n of nodes) {
+                  const svg = n.querySelector('svg');
+                  if (svg && svg.querySelector('rect') && !svg.querySelector('path')) { gen = true; break; }
+                }
+              } catch (e) {}
+              return JSON.stringify({ t: txt, len: body.length, gen: gen });
+            })()
+        """
+
         /** Извлечение текста последнего ответа ассистента: три стратегии по очереди. */
         private val EXTRACT_JS = """
             (function(){
@@ -222,14 +275,20 @@ class DeepSeekWebController(private val appContext: Context) {
     /** Расширенное состояние фоновой страницы: видно, что именно видит невидимый WebView. */
     private suspend fun diagState(web: WebView, tag: String) {
         val st = readSubmitState(web)
+        if (st == null) {
+            // Раньше здесь печаталось answers=-1 … url=? — сбой JS-моста выглядел
+            // как «нули», и настоящая причина терялась. Теперь это явный маркер.
+            diag("state[" + tag + "]: JS-мост не ответил (null) — WebView занят или страница не отрисована")
+            return
+        }
         diag(
-            "state[" + tag + "]: answers=" + (st?.answers ?: -1) +
-                " busy=" + (st?.busy ?: false) +
-                " draftLen=" + (st?.draftLen ?: -1) +
-                " sendReady=" + (st?.sendReady ?: false) +
-                " vis=" + (st?.vis ?: "?") +
-                " textLen=" + (st?.textLen ?: -1) +
-                " url=" + (st?.url ?: "?")
+            "state[" + tag + "]: answers=" + st.answers +
+                " busy=" + st.busy +
+                " draftLen=" + st.draftLen +
+                " sendReady=" + st.sendReady +
+                " vis=" + st.vis +
+                " textLen=" + st.textLen +
+                " url=" + st.url
         )
     }
 
@@ -447,7 +506,8 @@ class DeepSeekWebController(private val appContext: Context) {
     suspend fun sendMessageChecked(web: WebView, text: String, timeoutMs: Long = 60_000L): SubmitReport {
         // Фаза 1: страница должна быть отрисована. Иначе клик уходит в пустой
         // каркас SPA, поле формально очищается, а запрос на сервер не уходит.
-        awaitPageReady(web)
+        val pageReady = awaitPageReady(web)
+        if (!pageReady) diag("send: страница не готова (ready=false) — отправляем вслепую")
         if (text.isBlank()) return SubmitReport(false, "Пустой запрос")
         val before = countAnswers(web)
         if (!seedPrompt(web, text)) {
@@ -541,6 +601,32 @@ class DeepSeekWebController(private val appContext: Context) {
             .takeIf { it.isNotBlank() && it != "null" }
     }
 
+
+    private data class WaitProbe(val text: String, val bodyLen: Int, val generating: Boolean)
+
+    /** Единый опрос страницы в ожидании ответа (см. WAIT_PROBE_JS). */
+    private suspend fun readWaitProbe(
+        web: WebView,
+        baseline: String,
+        sentPrompt: String
+    ): WaitProbe? {
+        val script = WAIT_PROBE_JS.trimIndent()
+            .replace("__BASE__", JSONObject.quote(baseline.take(400)))
+            .replace("__SENT__", JSONObject.quote(sentPrompt.take(400)))
+        val raw = evalJs(web, script, 12_000L) ?: return null
+        val json = raw.removeSurrounding(""")
+            .replace("\"", """)
+            .replace("\\", "\")
+        return runCatching {
+            val o = JSONObject(json)
+            WaitProbe(
+                text = o.optString("t"),
+                bodyLen = o.optInt("len"),
+                generating = o.optBoolean("gen")
+            )
+        }.getOrNull()
+    }
+
     /**
      * Признак идущей генерации.
      *
@@ -575,7 +661,8 @@ class DeepSeekWebController(private val appContext: Context) {
         web: WebView,
         previousText: String?,
         timeoutMs: Long = TIMEOUT_MS,
-        onProgress: (String) -> Unit = {}
+        onProgress: (String) -> Unit = {},
+        sentPrompt: String = ""
     ): String? {
         val baseline = previousText.orEmpty()
         diag("wait: старт baselineLen=" + baseline.length)
@@ -585,9 +672,15 @@ class DeepSeekWebController(private val appContext: Context) {
         var sawAnyText = false
         var polls = 0
 
+        var baseBodyLen = 0
+        var grewAt = 0L
+
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
             delay(POLL_INTERVAL_MS)
-            val current = readLastAnswer(web).orEmpty()
+            // Один запрос к странице вместо двух: и текст, и длина body, и генерация.
+            val probe = readWaitProbe(web, baseline, sentPrompt)
+            val current = probe?.text.orEmpty()
+            if (probe != null && baseBodyLen <= 0) baseBodyLen = probe.bodyLen
             val changed = current != lastText
             if (changed) {
                 lastText = current
@@ -597,12 +690,28 @@ class DeepSeekWebController(private val appContext: Context) {
                     onProgress(current)
                 }
             }
-
-            val generating = evalJs(web, GENERATING_JS.trimIndent())?.trim() == "true"
+            // Запасной сигнал: страница заметно выросла — на ней появился текст ответа,
+            // даже если селекторы блоков не совпали с разметкой.
+            if (probe != null && baseBodyLen > 0 && probe.bodyLen - baseBodyLen > 120) {
+                if (grewAt == 0L) grewAt = System.currentTimeMillis()
+            } else {
+                grewAt = 0L
+            }
+            val generating = probe?.generating ?: false
             polls++
-            if (polls % 10 == 0) diag("wait: polls=" + polls + " len=" + current.length + " gen=" + generating + " sawAny=" + sawAnyText)
+            if (polls % 10 == 0) diag(
+                "wait: polls=" + polls + " len=" + current.length +
+                    " bodyLen=" + (probe?.bodyLen ?: -1) +
+                    " gen=" + generating + " sawAny=" + sawAnyText
+            )
             val stableFor = System.currentTimeMillis() - lastChangeAt
-            
+            val grewFor = if (grewAt > 0L) System.currentTimeMillis() - grewAt else -1L
+            // Текст вырос по body, но блоки не распознаны: считаем, что ответ виден.
+            if (!sawAnyText && grewFor >= STABLE_MS && current.isNotBlank()) {
+                sawAnyText = true
+                lastChangeAt = System.currentTimeMillis()
+                onProgress(current)
+            }
             // Готово, если текст отличается от исходного и стабилен достаточно долго
             if (sawAnyText && stableFor >= STABLE_MS) {
                 // при явном индикаторе генерации ждём ещё, но не дольше остатка таймаута
@@ -611,10 +720,7 @@ class DeepSeekWebController(private val appContext: Context) {
                 return lastText
             }
             // Резервный выход: текст не менялся дольше жёсткого порога.
-            // ВАЖНО: не зависит от индикатора генерации. Кнопка Stop могла «залипнуть»
-            // (селектор находит подстроку stop в class/aria-label любого элемента),
-            // и тогда условие !generating делало выход невозможным: чат ждал
-            // до самого таймаута при давно готовом ответе.
+            // ВАЖНО: не зависит от индикатора генерации. Кнопка Stop могла «залипнуть».
             if (sawAnyText && stableFor >= HARD_STABLE_MS) {
                 diag("wait: выход по стабильности (gen=" + generating + ") len=" + lastText.length)
                 return lastText
