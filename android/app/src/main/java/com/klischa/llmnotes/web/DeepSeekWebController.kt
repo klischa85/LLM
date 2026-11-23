@@ -614,9 +614,9 @@ class DeepSeekWebController(private val appContext: Context) {
             .replace("__BASE__", JSONObject.quote(baseline.take(400)))
             .replace("__SENT__", JSONObject.quote(sentPrompt.take(400)))
         val raw = evalJs(web, script, 12_000L) ?: return null
-        val json = raw.removeSurrounding(""")
-            .replace("\"", """)
-            .replace("\\", "\")
+        val json = raw.removeSurrounding("\"")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
         return runCatching {
             val o = JSONObject(json)
             WaitProbe(
